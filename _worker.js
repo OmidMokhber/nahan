@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.1.0";
+const CURRENT_VERSION = "2.2.0";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -19,6 +19,7 @@ const SYSTEM_DEFAULTS = {
     masterKey: "admin",
     metricNode: "time.is",
     cleanIps: "",
+    slaveNodes: "",
     deviceId: "",
     mode: "alpha",
     agent: "chrome",
@@ -46,6 +47,62 @@ let activeDeviceId = "";
 let sysUsageCache = { users: {} };
 let lastSysUsageSync = 0;
 
+async function d1Init(env) {
+    if(env.IOT_DB && !env.IOT_DB_INITIALIZED) {
+        try { await env.IOT_DB.prepare("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)").run(); env.IOT_DB_INITIALIZED = true; } catch(e) { env.IOT_DB_INITIALIZED = true; }
+    }
+}
+async function d1Get(env, key) {
+    if(!env.IOT_DB) return null;
+    await d1Init(env);
+    try { const { results } = await env.IOT_DB.prepare("SELECT value FROM kv_store WHERE key = ?").bind(key).all(); if(results && results.length > 0) return results[0].value; } catch(e) {}
+    return null;
+}
+async function d1Put(env, key, value) {
+    if(!env.IOT_DB) return;
+    await d1Init(env);
+    try { await env.IOT_DB.prepare("INSERT INTO kv_store (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(key, value).run(); } catch(e) {}
+}
+
+function sha224Hex(m) {
+    const msg = new TextEncoder().encode(m);
+    const K = [0x428A2F98,0x71374491,0xB5C0FBCF,0xE9B5DBA5,0x3956C25B,0x59F111F1,0x923F82A4,0xAB1C5ED5,0xD807AA98,0x12835B01,0x243185BE,0x550C7DC3,0x72BE5D74,0x80DEB1FE,0x9BDC06A7,0xC19BF174,0xE49B69C1,0xEFBE4786,0x0FC19DC6,0x240CA1CC,0x2DE92C6F,0x4A7484AA,0x5CB0A9DC,0x76F988DA,0x983E5152,0xA831C66D,0xB00327C8,0xBF597FC7,0xC6E00BF3,0xD5A79147,0x06CA6351,0x14292967,0x27B70A85,0x2E1B2138,0x4D2C6DFC,0x53380D13,0x650A7354,0x766A0ABB,0x81C2C92E,0x92722C85,0xA2BFE8A1,0xA81A664B,0xC24B8B70,0xC76C51A3,0xD192E819,0xD6990624,0xF40E3585,0x106AA070,0x19A4C116,0x1E376C08,0x2748774C,0x34B0BCB5,0x391C0CB3,0x4ED8AA4A,0x5B9CCA4F,0x682E6FF3,0x748F82EE,0x78A5636F,0x84C87814,0x8CC70208,0x90BEFFFA,0xA4506CEB,0xBEF9A3F7,0xC67178F2];
+    let H = [0xC1059ED8,0x367CD507,0x3070DD17,0xF70E5939,0xFFC00B31,0x68581511,0x64F98FA7,0xBEFA4FA4];
+    const words = []; const n = Math.ceil((msg.length + 9) / 64) * 16;
+    for (let i = 0; i < n; i++) words[i] = 0;
+    for (let i = 0; i < msg.length; i++) words[i >> 2] |= msg[i] << (24 - (i % 4) * 8);
+    words[msg.length >> 2] |= 0x80 << (24 - (msg.length % 4) * 8);
+    words[n - 1] = msg.length * 8;
+    const W = [];
+    for (let i = 0; i < n; i += 16) {
+        let [a, b, c, d, e, f, g, h] = H;
+        for (let j = 0; j < 64; j++) {
+            if (j < 16) W[j] = words[i + j];
+            else {
+                let w15 = W[j - 15], w2 = W[j - 2];
+                let s0 = (w15 >>> 7 | w15 << 25) ^ (w15 >>> 18 | w15 << 14) ^ (w15 >>> 3);
+                let s1 = (w2 >>> 17 | w2 << 15) ^ (w2 >>> 19 | w2 << 13) ^ (w2 >>> 10);
+                W[j] = (W[j - 16] + s0 + W[j - 7] + s1) >>> 0;
+            }
+            let S1 = (e >>> 6 | e << 26) ^ (e >>> 11 | e << 21) ^ (e >>> 25 | e << 7);
+            let ch = (e & f) ^ (~e & g); let temp1 = (h + S1 + ch + K[j] + W[j]) >>> 0;
+            let S0 = (a >>> 2 | a << 30) ^ (a >>> 13 | a << 19) ^ (a >>> 22 | a << 10);
+            let maj = (a & b) ^ (a & c) ^ (b & c); let temp2 = (S0 + maj) >>> 0;
+            h = g; g = f; f = e; e = (d + temp1) >>> 0; d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+        }
+        H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+        H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+    }
+    return H.slice(0, 7).map(v => v.toString(16).padStart(8, '0')).join('');
+}
+const trojanHashCache = new Map();
+function getTrojanHash(uuid) {
+    if (trojanHashCache.has(uuid)) return trojanHashCache.get(uuid);
+    const hash = sha224Hex(uuid);
+    trojanHashCache.set(uuid, hash);
+    return hash;
+}
+
 function trackUsage(uuid, bytes, env, ctx) {
     if (!sysUsageCache) sysUsageCache = { users: {} };
     if (!sysUsageCache.users) sysUsageCache.users = {};
@@ -53,10 +110,10 @@ function trackUsage(uuid, bytes, env, ctx) {
     sysUsageCache.users[uuid].b += bytes;
     
     const now = Date.now();
-    if (now - lastSysUsageSync > 10000) {
+    if (now - lastSysUsageSync > 30000) {
         lastSysUsageSync = now;
         if (env && env.IOT_DB) {
-            ctx?.waitUntil(env.IOT_DB.put("sys_usage", JSON.stringify(sysUsageCache)).catch(()=>{}));
+            ctx?.waitUntil(d1Put(env, "sys_usage", JSON.stringify(sysUsageCache)).catch(()=>{}));
         }
     }
 }
@@ -164,13 +221,13 @@ async function serveMaintenancePage(request, url) {
 async function loadSysConfig(env) {
     let dbData = null;
     if (env.IOT_DB) {
-        try { const stored = await env.IOT_DB.get("sys_config"); if (stored) dbData = JSON.parse(stored); } catch (e) { }
-        try { const ustored = await env.IOT_DB.get("sys_usage"); if (ustored) sysUsageCache = JSON.parse(ustored); } catch (e) { }
+        try { const stored = await d1Get(env, "sys_config"); if (stored) dbData = JSON.parse(stored); } catch (e) { }
+        try { const ustored = await d1Get(env, "sys_usage"); if (ustored) sysUsageCache = JSON.parse(ustored); } catch (e) { }
     }
     sysConfig = { ...SYSTEM_DEFAULTS, ...dbData };
     let externalRelayFromDb = null;
     if (env.IOT_DB) {
-        try { externalRelayFromDb = await env.IOT_DB.get("backup_ip"); } catch (e) { }
+        try { externalRelayFromDb = await d1Get(env, "backup_ip"); } catch (e) { }
     }
     const defaultRelay = ["pro", "xy", "ip.cmliussss.net"].join("");
     sysConfig.customRelay = externalRelayFromDb ?? env.RELAY_IP ?? defaultRelay;
@@ -271,11 +328,11 @@ async function logActivity(env, type, detail) {
     try {
         const ts = new Date().toISOString();
         let logs = [];
-        const stored = await env.IOT_DB.get("sys_logs");
+        const stored = await d1Get(env, "sys_logs");
         if (stored) logs = JSON.parse(stored);
         logs.unshift({ ts, type, detail });
         if (logs.length > 50) logs = logs.slice(0, 50);
-        await env.IOT_DB.put("sys_logs", JSON.stringify(logs));
+        await d1Put(env, "sys_logs", JSON.stringify(logs));
     } catch (e) {}
 }
 
@@ -286,7 +343,7 @@ async function handleLogs(request, env) {
             if (data.key !== sysConfig.masterKey) return new Response(JSON.stringify({ success: false }), { status: 401 });
             let logs = [];
             if (env.IOT_DB) {
-                const stored = await env.IOT_DB.get("sys_logs");
+                const stored = await d1Get(env, "sys_logs");
                 if (stored) logs = JSON.parse(stored);
             }
             return new Response(JSON.stringify({ success: true, logs }), { status: 200 });
@@ -333,7 +390,21 @@ async function handleConfigSync(request, env, ctx) {
         const nextConfig = { ...sysConfig, ...data.config };
         sysConfig = nextConfig;
         
-        await env.IOT_DB.put("sys_config", JSON.stringify(nextConfig));
+        await d1Put(env, "sys_config", JSON.stringify(nextConfig));
+
+        if (!data.fromMaster && nextConfig.slaveNodes && nextConfig.slaveNodes.trim().length > 0) {
+            let nodes = nextConfig.slaveNodes.split(',').map(s=>s.trim()).filter(Boolean);
+            let currentHost = new URL(request.url).hostname;
+            nodes.forEach(node => {
+                if(node !== currentHost) {
+                     ctx?.waitUntil(fetch(`https://${node}/${encodeURI(nextConfig.apiRoute)}/api/sync`, {
+                         method: 'POST',
+                         headers: { 'Content-Type': 'application/json' },
+                         body: JSON.stringify({ key: nextConfig.masterKey, config: nextConfig, fromMaster: true })
+                     }).catch(() => {}));
+                }
+            });
+        }
         
         if (nextConfig.tgToken && ctx) {
             const hookUrl = `https://${new URL(request.url).hostname}/${encodeURI(nextConfig.apiRoute)}/tg`;
@@ -396,11 +467,11 @@ async function handleTelegramWebhook(request, env, hostName) {
                     });
                 } else if (data === "cb_pause") {
                     sysConfig.isPaused = true;
-                    await env.IOT_DB.put("sys_config", JSON.stringify({ ...sysConfig, isPaused: true }));
+                    await d1Put(env, "sys_config", JSON.stringify({ ...sysConfig, isPaused: true }));
                     await fetch(`${tgApi}/answerCallbackQuery`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callback_query_id: cb.id, text: "سیستم متوقف شد. 🔴" }) });
                 } else if (data === "cb_resume") {
                     sysConfig.isPaused = false;
-                    await env.IOT_DB.put("sys_config", JSON.stringify({ ...sysConfig, isPaused: false }));
+                    await d1Put(env, "sys_config", JSON.stringify({ ...sysConfig, isPaused: false }));
                     await fetch(`${tgApi}/answerCallbackQuery`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callback_query_id: cb.id, text: "سیستم مجدداً فعال شد. 🟢" }) });
                 }
             }
@@ -413,11 +484,11 @@ async function handleTelegramWebhook(request, env, hostName) {
                     await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: `وضعیت سیستم: ${sysConfig.isPaused ? "🔴 متوقف شده" : "🟢 فعال"}` }) });
                 } else if (text === "/pause") {
                     sysConfig.isPaused = true;
-                    await env.IOT_DB.put("sys_config", JSON.stringify({ ...sysConfig, isPaused: true }));
+                    await d1Put(env, "sys_config", JSON.stringify({ ...sysConfig, isPaused: true }));
                     await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: "🔴 جریان داده‌ها متوقف شد." }) });
                 } else if (text === "/resume") {
                     sysConfig.isPaused = false;
-                    await env.IOT_DB.put("sys_config", JSON.stringify({ ...sysConfig, isPaused: false }));
+                    await d1Put(env, "sys_config", JSON.stringify({ ...sysConfig, isPaused: false }));
                     await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: "🟢 جریان داده‌ها مجدداً برقرار شد." }) });
                 } else if (text === "/ping") {
                     const upSeconds = Math.floor((Date.now() - isolateStartTime)/1000);
@@ -427,7 +498,7 @@ async function handleTelegramWebhook(request, env, hostName) {
                 } else if (text === "/panic") {
                     sysConfig.apiRoute = Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2,'0')).join('');
                     sysConfig.isPaused = true;
-                    await env.IOT_DB.put("sys_config", JSON.stringify(sysConfig));
+                    await d1Put(env, "sys_config", JSON.stringify(sysConfig));
                     await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: `🚨 PANIC MODE ACTIVATED 🚨\n\nRoute randomized & System Paused.\nAccess Revoked.` }) });
                 } else if (text.startsWith("/users")) {
                     let umsg = "👥 لیست کاربران:\n\n";
@@ -455,7 +526,7 @@ async function handleTelegramWebhook(request, env, hostName) {
                             expiryMs: days ? Date.now() + days*86400000 : null,
                             createdAt: Date.now()
                         });
-                        await env.IOT_DB.put("sys_config", JSON.stringify(sysConfig));
+                        await d1Put(env, "sys_config", JSON.stringify(sysConfig));
                         await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: `✅ کاربر جدید اضافه شد.\n\nنام: ${name}\nUUID: ${newUuid}\nحجم: ${gb ? gb + ' GB' : 'نامحدود'}\nاعتبار: ${days ? days + ' روز' : 'نامحدود'}` }) });
                     }
                 } else if (text.startsWith("/deluser")) {
@@ -466,7 +537,7 @@ async function handleTelegramWebhook(request, env, hostName) {
                         const initLen = sysConfig.users ? sysConfig.users.length : 0;
                         if(sysConfig.users) sysConfig.users = sysConfig.users.filter(u => u.id !== parts[1]);
                         if(sysConfig.users.length < initLen) {
-                            await env.IOT_DB.put("sys_config", JSON.stringify(sysConfig));
+                            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
                             await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: "✅ کاربر حذف شد." }) });
                         } else {
                             await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: "❌ کاربری با این UUID یافت نشد." }) });
@@ -565,6 +636,17 @@ async function startDataPipe(webSocket, env, ctx) {
         } else {
             let ePos = bufferData.byteLength;
             for (let i = 0; i < bufferData.byteLength; i++) { if (view[i] === 0x0D && view[i + 1] === 0x0A) { ePos = i; break; } }
+            
+            let clientHashHex = new TextDecoder().decode(view.slice(0, ePos));
+            let validProfile = getAllProfiles().find(p => getTrojanHash(p.id) === clientHashHex);
+            if (!validProfile) return false;
+            
+            activeClientHash = validProfile.id.replace(/-/g, '').toLowerCase();
+            let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0 };
+            uTrack.connects++;
+            uTrack.last = Date.now();
+            uuidUsage.set(activeClientHash, uTrack);
+
             let hPos = ePos + 2; hPos++;
             let aType = view[hPos]; hPos++; let aLen = 0;
 
@@ -628,6 +710,7 @@ function getAllProfiles(targetSub = null) {
         sysConfig.users.forEach(u => {
             let skip = false;
             if (u.expiryMs && now > u.expiryMs) skip = true;
+            if (u.isPaused) skip = true;
             if (u.limitGb && sysUsageCache && sysUsageCache.users && sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()]) {
                 if (sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()].b >= u.limitGb * 1024 * 1024 * 1024) skip = true;
             }
@@ -644,56 +727,77 @@ function getAllProfiles(targetSub = null) {
 }
 
 function buildSingleUri(hostName) {
-    let finalIP = getCleanIps(hostName)[0];
+    let allHostNames = [hostName];
+    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(',').map(s=>s.trim()).filter(Boolean));
+    let finalHost = allHostNames[0];
+    let finalIP = getCleanIps(finalHost)[0];
     let sec = getTransportParams(sysConfig.socketPort);
     let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
     let uriProto = sysConfig.mode === "beta" ? getBeta() : getAlpha();
-    let ext = `encryption=none&security=${sec}&sni=${hostName}&fp=${sysConfig.agent}&type=ws&host=${hostName}&path=${reqPath}`;
+    let ext = `encryption=none&security=${sec}&sni=${finalHost}&fp=${sysConfig.agent}&type=ws&host=${finalHost}&path=${reqPath}`;
     if (sysConfig.enableOpt2) ext += `&pbk=enabled`;
-    return `${uriProto}://${activeDeviceId}@${finalIP}:${sysConfig.socketPort}?${ext}#${hostName}`;
+    return `${uriProto}://${activeDeviceId}@${finalIP}:${sysConfig.socketPort}?${ext}#${finalHost}`;
 }
 
 function buildUriProfile(hostName, targetSub = null) {
-    let ips = getCleanIps(hostName);
+    let allHostNames = [hostName];
+    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(',').map(s=>s.trim()).filter(Boolean));
+    
     let sec = getTransportParams(sysConfig.socketPort);
     let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
-    let extBase = `encryption=none&security=${sec}&sni=${hostName}&fp=${sysConfig.agent}&type=ws&host=${hostName}&path=${reqPath}`;
-    if (sysConfig.enableOpt2) extBase += `&pbk=enabled`;
-
+    
     let lines = [];
     let profiles = getAllProfiles(targetSub);
     
     profiles.forEach(p => {
-        ips.forEach(ip => {
-            let nameExt = p.name === "Default" ? `[${ip}]` : `[${ip}]-${p.name}`;
-            let vName = `V-Core-${nameExt}`;
-            let tName = `T-Core-${nameExt}`;
-            
-            lines.push(`${getAlpha()}://${p.id}@${ip}:${sysConfig.socketPort}?${extBase}#${vName}`);
-            lines.push(`${getBeta()}://${p.id}@${ip}:${sysConfig.socketPort}?${extBase}#${tName}`);
+        allHostNames.forEach(hName => {
+            let ips = getCleanIps(hName);
+            let extBase = `encryption=none&security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${reqPath}`;
+            if (sysConfig.enableOpt2) extBase += `&pbk=enabled`;
+            ips.forEach(ip => {
+                let nameExt = p.name === "Default" ? `[${ip}]` : `[${ip}]-${p.name}`;
+                let vName = `V-Core-${nameExt}`;
+                let tName = `T-Core-${nameExt}`;
+                
+                if (sysConfig.mode === "alpha" || sysConfig.mode === "both") {
+                    lines.push(`${getAlpha()}://${p.id}@${ip}:${sysConfig.socketPort}?${extBase}#${vName}`);
+                }
+                if (sysConfig.mode === "beta" || sysConfig.mode === "both") {
+                    lines.push(`${getBeta()}://${p.id}@${ip}:${sysConfig.socketPort}?${extBase}#${tName}`);
+                }
+            });
         });
     });
     return lines.join('\n');
 }
 
 function buildYamlProfile(hostName, targetSub = null) {
-    let ips = getCleanIps(hostName);
+    let allHostNames = [hostName];
+    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(',').map(s=>s.trim()).filter(Boolean));
+    
     let sec = getTransportParams(sysConfig.socketPort) === "tls" ? "true" : "false";
     let proxies = [];
     let proxyNames = [];
     let profiles = getAllProfiles(targetSub);
 
     profiles.forEach(p => {
-        ips.forEach(ip => {
-            let nameExt = p.name === "Default" ? `[${ip}]` : `[${ip}]-${p.name}`;
-            
-            let vName = `V-Core-${nameExt}`;
-            proxyNames.push(`"${vName}"`);
-            proxies.push(`- name: "${vName}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${sysConfig.socketPort}\n  uuid: ${p.id}\n  udp: true\n  tls: ${sec}\n  sni: ${hostName}\n  client-fingerprint: ${sysConfig.agent}\n  network: ws\n  ws-opts:\n    path: "/${sysConfig.apiRoute}"\n    headers: { Host: ${hostName} }\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+        allHostNames.forEach(hName => {
+            let ips = getCleanIps(hName);
+            ips.forEach(ip => {
+                let nameExt = p.name === "Default" ? `[${ip}]` : `[${ip}]-${p.name}`;
+                
+                if (sysConfig.mode === "alpha" || sysConfig.mode === "both") {
+                    let vName = `V-Core-${nameExt}`;
+                    proxyNames.push(`"${vName}"`);
+                    proxies.push(`- name: "${vName}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${sysConfig.socketPort}\n  uuid: ${p.id}\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent}\n  network: ws\n  ws-opts:\n    path: "/${sysConfig.apiRoute}"\n    headers: { Host: ${hName} }\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+                }
 
-            let tName = `T-Core-${nameExt}`;
-            proxyNames.push(`"${tName}"`);
-            proxies.push(`- name: "${tName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${sysConfig.socketPort}\n  password: ${p.id}\n  udp: true\n  tls: ${sec}\n  sni: ${hostName}\n  client-fingerprint: ${sysConfig.agent}\n  network: ws\n  ws-opts:\n    path: "/${sysConfig.apiRoute}"\n    headers: { Host: ${hostName} }\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+                if (sysConfig.mode === "beta" || sysConfig.mode === "both") {
+                    let tName = `T-Core-${nameExt}`;
+                    proxyNames.push(`"${tName}"`);
+                    proxies.push(`- name: "${tName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${sysConfig.socketPort}\n  password: ${p.id}\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent}\n  network: ws\n  ws-opts:\n    path: "/${sysConfig.apiRoute}"\n    headers: { Host: ${hName} }\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+                }
+            });
         });
     });
 
@@ -739,7 +843,7 @@ function getDashboardUI(hasDB) {
 
       <!-- Global Controls -->
       <div class="fixed top-4 end-4 md:top-6 md:end-6 flex items-center space-x-2 space-x-reverse z-50">
-          <span id="top-version-badge" class="px-2.5 py-1 bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 rounded-full text-[11px] font-mono font-bold border border-slate-200 dark:border-darkborder shadow-sm">v2.1.0</span>
+          <span id="top-version-badge" class="px-2.5 py-1 bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 rounded-full text-[11px] font-mono font-bold border border-slate-200 dark:border-darkborder shadow-sm">v2.2.0</span>
           <a href="https://github.com/itsyebekhe/nahan" id="github-link-btn" target="_blank" class="p-2 bg-white/80 dark:bg-darkcard/80 backdrop-blur rounded-full shadow border border-slate-200 dark:border-darkborder text-slate-600 dark:text-slate-400 hover:text-primary transition-all">
               <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd"></path></svg>
           </a>
@@ -779,7 +883,7 @@ function getDashboardUI(hasDB) {
                   <div class="w-10 h-10 rounded-xl bg-indigo-50 dark:bg-indigo-900/40 text-primary flex items-center justify-center me-3 shrink-0"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg></div>
                   <div class="flex flex-col">
                       <h1 class="font-black text-xl leading-none" data-i18n="title">Nahan</h1>
-                      <span id="app-version" class="text-[10px] font-mono text-slate-400 mt-1 font-semibold">v2.1.0</span>
+                      <span id="app-version" class="text-[10px] font-mono text-slate-400 mt-1 font-semibold">v2.2.0</span>
                   </div>
               </div>
               <nav class="flex-1 p-4 space-y-2 overflow-y-auto">
@@ -916,6 +1020,7 @@ function getDashboardUI(hasDB) {
                                   <select id="cfg-proto" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none appearance-none">
                                       <option value="alpha">Alpha Mode (V-Core)</option>
                                       <option value="beta">Beta Mode (T-Core)</option>
+                                      <option value="both">Both (V-Core & T-Core)</option>
                                   </select>
                               </div>
                               <div class="space-y-1">
@@ -963,13 +1068,22 @@ function getDashboardUI(hasDB) {
                       <!-- ADVANCED VIEW -->
                       <div id="view-advanced" class="hidden space-y-6">
                           <!-- Multi Clean IP Section -->
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder">
+                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder mb-4">
                               <div class="flex items-center justify-between mb-4">
                                   <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider" data-i18n="lbl_clean_ips">Clean IPs (Multi-Generator)</h3>
                                   <span class="text-xs bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300 px-2 py-1 rounded-md font-bold" id="ip-count-badge">1 Config Set</span>
                               </div>
                               <textarea id="cfg-ips" rows="3" data-i18n="ph_clean_ips" placeholder="" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
                               <p class="text-xs text-slate-400 mt-2" data-i18n="desc_clean_ips">Put one IP per line. The Sync URL will multiply configs for all IPs.</p>
+                          </div>
+                          
+                          <!-- Slave Nodes Section -->
+                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder">
+                              <div class="flex items-center justify-between mb-4">
+                                  <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider">Slave Worker Nodes</h3>
+                              </div>
+                              <textarea id="cfg-nodes" rows="2" placeholder="node1.worker.dev, node2.worker.dev" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
+                              <p class="text-xs text-slate-400 mt-2">Enter your other worker URLs (comma-separated). This panel will push configurations to them automatically, and include them in generated subscriptions!</p>
                           </div>
   
                           <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5">
@@ -1485,6 +1599,7 @@ function getDashboardUI(hasDB) {
                       document.getElementById('cfg-fp').value = conf.agent || 'chrome';
                       document.getElementById('cfg-dns').value = conf.resolveIp || '';
                       document.getElementById('cfg-ips').value = conf.cleanIps || '';
+                      document.getElementById('cfg-nodes').value = conf.slaveNodes || '';
                       document.getElementById('cfg-fake').value = conf.maintenanceHost || '';
                       document.getElementById('cfg-relay').value = conf.backupRelay || '';
                       document.getElementById('cfg-tfo').checked = conf.enableOpt1 || false;
@@ -1503,7 +1618,7 @@ function getDashboardUI(hasDB) {
                       renderUsersTable();
                       try { checkUpdate(); } catch(ue) { console.error(ue); }
 
-                      ['cfg-proto','cfg-port','cfg-fp','cfg-ips','cfg-path', 'cfg-relay'].forEach(id => {
+                      ['cfg-proto','cfg-port','cfg-fp','cfg-ips','cfg-nodes','cfg-path', 'cfg-relay'].forEach(id => {
                           const el = document.getElementById(id);
                           if(el) { el.addEventListener('input', updateUI); el.addEventListener('change', updateUI); }
                       });
@@ -1575,7 +1690,7 @@ function getDashboardUI(hasDB) {
                   config: {
                       mode: el('cfg-proto').value, socketPort: el('cfg-port').value, deviceId: el('cfg-uuid').value,
                       apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
-                      resolveIp: el('cfg-dns').value, cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
+                      resolveIp: el('cfg-dns').value, cleanIps: el('cfg-ips').value, slaveNodes: el('cfg-nodes').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
                       enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
                       tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value,
                       cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
@@ -1622,16 +1737,19 @@ function getDashboardUI(hasDB) {
                   
                   let linkHtml = \`<button onclick="copyData('sync-\${u.id}')" class="text-primary hover:text-indigo-700 bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-900/30 dark:hover:bg-indigo-800/50 p-2 rounded-lg" title="Copy Subscription Link">🔗</button>\`;
                   
+                  let pauseBtnHtml = \`<button onclick="togglePauseUser('\${u.id}')" class="\${u.isPaused ? 'text-green-500 hover:text-green-700 bg-green-50 hover:bg-green-100 dark:bg-green-900/30 dark:hover:bg-green-800/50' : 'text-amber-500 hover:text-amber-700 bg-amber-50 hover:bg-amber-100 dark:bg-amber-900/30 dark:hover:bg-amber-800/50'} p-2 rounded-lg" title="\${u.isPaused ? 'Resume User' : 'Pause User'}">\${u.isPaused ? '▶️' : '⏸️'}</button>\`;
+
                   let tr = document.createElement('tr');
                   tr.className = "hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors";
                   tr.innerHTML = \`
-                      <td class="px-4 py-4 font-bold text-slate-700 dark:text-slate-300">\${u.name} \${isExp ? '🔴' : '🟢'}</td>
+                      <td class="px-4 py-4 font-bold text-slate-700 dark:text-slate-300">\${u.name} \${u.isPaused ? '⏸️' : (isExp ? '🔴' : '🟢')}</td>
                       <td class="px-4 py-4 font-mono text-xs text-slate-500 select-all">\${u.id}</td>
                       <td class="px-4 py-4 text-slate-600 dark:text-slate-400 font-mono"><div class="flex flex-col"><span class="font-bold">\${mb} MB</span><span class="text-xs opacity-70">Limit: \${limitGbTxt} (\${per})</span></div></td>
                       <td class="px-4 py-4 text-slate-600 dark:text-slate-400">\${expTxt}</td>
                       <td class="px-4 py-4 text-end space-x-2 space-x-reverse">
                           <input type="hidden" id="sync-\${u.id}" value="\${window.nahanProfiles.find(p => p.id === u.id)?.sync || ''}">
                           \${linkHtml}
+                          \${pauseBtnHtml}
                           <button onclick="deleteUser('\${u.id}')" class="text-red-500 hover:text-red-700 bg-red-50 hover:bg-red-100 dark:bg-red-900/30 dark:hover:bg-red-800/50 p-2 rounded-lg">🗑️</button>
                       </td>
                   \`;
@@ -1648,6 +1766,17 @@ function getDashboardUI(hasDB) {
               // Automatically sync
               renderUsersTable();
               doSaveDirectly();
+          }
+
+          function togglePauseUser(uuid) {
+              if(window.nahanConfig && window.nahanConfig.users) {
+                  let usr = window.nahanConfig.users.find(u => u.id === uuid);
+                  if (usr) {
+                      usr.isPaused = !usr.isPaused;
+                      renderUsersTable();
+                      doSaveDirectly();
+                  }
+              }
           }
 
           function commitAddUser() {
@@ -1719,7 +1848,7 @@ function getDashboardUI(hasDB) {
                   } catch(e) {}
                   
                   if (!remoteVer) {
-                      const res = await fetch('https://raw.githubusercontent.com/' + repo + '/main/_worker.js');
+                      const res = await fetch('https://raw.githubusercontent.com/' + repo + '/main/worker.js');
                       if (res.ok) {
                           const code = await res.text();
                           const match = code.match(/const\\s+CURRENT_VERSION\\s*=\\s*["\']([^"\']+)["\']/);
