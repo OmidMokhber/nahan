@@ -4924,8 +4924,8 @@ function getDashboardUI(hasDB) {
                   try {
                       let parsed = JSON.parse(savedSession);
                       if (parsed && parsed.expiry && Date.now() < parsed.expiry) {
-                          sessionKey = parsed.key;
-                          doLogin(true);
+                           sessionKey = parsed.key;
+                           doLogin(true).then(() => loadDashboard());
                       } else {
                           localStorage.removeItem('nahan_session');
                       }
