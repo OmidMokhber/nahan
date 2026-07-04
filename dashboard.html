@@ -2877,6 +2877,23 @@ proxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-20
                       document.getElementById('net-colo').textContent = data.network.colo;
                       document.getElementById('net-loc').textContent = data.network.loc;
                       const conf = data.config;
+                      if (conf && conf.slaveNodes && conf.slaveNodes.trim().length > 0) {
+                          if (!conf.linkedPanels) conf.linkedPanels = [];
+                          var nodes = conf.slaveNodes.split(/[\r\n,;]+/).map(function(s){return s.trim();}).filter(Boolean);
+                          var syncKey = conf.syncApiKey || '';
+                          nodes.forEach(function(node) {
+                              var cleanNode = node.replace(/^[a-zA-Z]+:\/\//, "").split("/")[0].split("@").pop().split(":")[0].toLowerCase();
+                              var exists = conf.linkedPanels.some(function(p) {
+                                  if (!p || !p.url) return false;
+                                  var cleanUrl = p.url.replace(/^[a-zA-Z]+:\/\//, "").split("/")[0].split("@").pop().split(":")[0].toLowerCase();
+                                  return cleanUrl === cleanNode;
+                              });
+                              if (!exists) {
+                                  conf.linkedPanels.push({ url: node, apiKey: syncKey });
+                              }
+                          });
+                          conf.slaveNodes = '';
+                      }
                       document.getElementById('cfg-proto').value = conf.mode || 'alpha';
                       let pList = (conf.socketPorts || conf.socketPort || '443').split(',');
                       Array.from(document.getElementById('cfg-port').options).forEach(o => o.selected = pList.includes(o.value));
@@ -3036,7 +3053,7 @@ proxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-20
                       nameStrategy: el('cfg-name-strategy').value,
                       namePrefix: el('cfg-name-prefix').value,
                       fakeConfigs: getFakeConfigsFromUI(),
-                      slaveNodes: (window.nahanConfig && window.nahanConfig.slaveNodes) ? window.nahanConfig.slaveNodes : '',
+                      slaveNodes: '',
                       linkedPanels: (window.nahanConfig && Array.isArray(window.nahanConfig.linkedPanels)) ? window.nahanConfig.linkedPanels : []
                   }
               };
@@ -3450,7 +3467,7 @@ function getSelectedCheckboxes(wrapId) {
     return checked.join(',');
 }
 function getGlobalNodeList() {
-    var nodes = (window.nahanConfig && window.nahanConfig.slaveNodes ? window.nahanConfig.slaveNodes : "").split(/[\s,;]+/).map(function(s){return s.trim();}).filter(Boolean);
+    var nodes = [];
     var lp = (window.nahanConfig && Array.isArray(window.nahanConfig.linkedPanels)) ? window.nahanConfig.linkedPanels : [];
     lp.forEach(function(p){
         var raw = (p && typeof p === 'object') ? (p.url || '') : (p || '');
