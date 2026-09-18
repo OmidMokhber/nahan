@@ -8,6 +8,33 @@ All notable changes to Project Nahan will be documented in this file.
 <!-- LANG:EN -->
 
 
+## [3.0.2] - ۱۴۰۵-۰۶-۲۷ (2026-09-18)
+
+<!-- LANG:FA -->
+### اضافه شده (Added)
+- **شمارش دقیق ترافیک (بایت واقعی)**: جایگزینی تخمین 6000 ریکوئست = 1GB با شمارش واقعی بایت آپلود/دانلود هر تونل؛ سازگار با داده‌های قبلی (مهاجرت خودکار).
+- **سوپاپ اطمینان (Circuit breaker)**: تخلیه بار در فشار (استتار، رفرش ساب، هندشیک).
+- **خودترمیمی رله‌ها**: قرنطینه غیرفعال، تست فعال TLS، قبرستون با بازگشت خودکار؛ کلید توقف `autoPruneRelays`.
+- **محافظ طوفان reconnect و حالت تعمیر (maintenanceMode)** و محافظ بروت‌فورس لاگین.
+- **تایم‌اوت همه fetchها** (پیش‌فرض 10s، آپلود CF API سی‌ثانیه).
+
+### امنیتی (Security)
+- **بستن اجرای کد از راه دور**: اکشن `deploy` فقط با `allowRemoteDeploy: true` (پیش‌فرض بسته).
+<!-- LANG:FA -->
+
+<!-- LANG:EN -->
+### Added
+- **Accurate traffic accounting (real bytes)**: replaced the 6000-requests = 1GB estimate with real per-tunnel up/down byte counting; legacy rows auto-migrate.
+- **Circuit breaker**: load shedding under pressure (decoy, sub refresh, handshake).
+- **Relay self-healing**: passive quarantine, active TLS probing, graveyard with auto-resurrect; `autoPruneRelays` kill switch.
+- **Reconnect-storm backoff, maintenanceMode**, and login brute-force shield.
+- **Timeouts on all fetches** (10s default, 30s for CF API uploads).
+
+### Security
+- **Remote-code-execution gate**: `deploy` action requires `allowRemoteDeploy: true` (default closed).
+<!-- LANG:EN -->
+
+
 ## [3.0.1] - ۱۴۰۵-۰۶-۰۲ (2026-08-24)
 
 <!-- LANG:FA -->

@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "3.0.1";
+const CURRENT_VERSION = "3.0.2";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -23,6 +23,64 @@ const safeBtoa = (str) => {
         return btoa(str);
     }
 };
+
+// Accurate byte accounting (Sepidar-grade): real up+down bytes per tunnel.
+// Legacy estimate kept ONLY as a one-time migration for pre-existing rows:
+// 1GB per 6000 connections. Limits stay in req units (dashboard contract:
+// GB*6000), converted to bytes at comparison time, so thresholds are exact.
+// Hard-timeout fetch: every outbound fetch must be bounded, otherwise a
+// hanging origin (ubuntu/docker, ip-api, DoH, github, telegram, CF API)
+// leaves the request with no events in the loop -> Cloudflare 1101
+// ("never generate a response"). Same signature as fetch + timeoutMs.
+async function fetchT(url, init = {}, timeoutMs = 10000) {
+    try {
+        if (
+            typeof AbortSignal !== "undefined" &&
+            typeof AbortSignal.timeout === "function"
+        ) {
+            // NOTE: plain fetch() here on purpose — fetchT must never call
+            // itself (infinite recursion).
+            return await fetch(url, {
+                ...init,
+                signal: AbortSignal.timeout(timeoutMs),
+            });
+        }
+        return await fetch(url, { ...init });
+    } catch (e) {
+        throw e;
+    }
+}
+const REQ_BYTES_EST = 1073741824 / 6000;
+function usageTotalBytes(u) {
+    try {
+        if (!u) return 0;
+        if (typeof u.bytes === "number" && u.bytes >= 0)
+            return Math.floor(u.bytes);
+        return Math.floor((u.reqs || 0) * REQ_BYTES_EST);
+    } catch (e) {
+        return 0;
+    }
+}
+function usageDailyBytes(u, today) {
+    try {
+        if (!u) return 0;
+        const day =
+            today || new Date().toISOString().split("T")[0];
+        if ((u.lastDay || "") !== day) return 0;
+        if (typeof u.dBytes === "number" && u.dBytes >= 0)
+            return Math.floor(u.dBytes);
+        return Math.floor((u.dReqs || 0) * REQ_BYTES_EST);
+    } catch (e) {
+        return 0;
+    }
+}
+function limitReqToBytes(limitReq) {
+    try {
+        return limitReq ? Math.floor(limitReq * REQ_BYTES_EST) : 0;
+    } catch (e) {
+        return 0;
+    }
+}
 
 const SYSTEM_DEFAULTS = {
     name: "",
@@ -74,11 +132,49 @@ const SYSTEM_DEFAULTS = {
         { name: "📊 {usage}", enabled: true },
         { name: "📅 {expiry}", enabled: true },
     ],
+    // Sepidar-grade hardening flags (safe defaults; merged, never wiped).
+    maintenanceMode: false,
+    allowRemoteDeploy: false,
+    autoPruneRelays: true,
 };
 
 let sysConfig = { ...SYSTEM_DEFAULTS };
 let isolateStartTime = 0;
 let activeConnections = 0;
+// Circuit breaker (Sepidar-grade load shedding): when an isolate is
+// saturated, cheap static work is shed first so real tunnels survive.
+// Level 1: skip the ubuntu/docker origin fetch (serve 404 instead).
+// Level 2: also tarpit new WS handshakes + refuse non-browser sub refresh.
+let INFLIGHT_HTTP = 0;
+let OPEN_WS = 0;
+function breakerLevel() {
+    try {
+        if (INFLIGHT_HTTP > 200 || OPEN_WS > 400) return 2;
+        if (INFLIGHT_HTTP > 100 || OPEN_WS > 200) return 1;
+    } catch (e) {}
+    return 0;
+}
+function sleepMs(ms) {
+    return new Promise((res) => setTimeout(res, ms));
+}
+// Bounded wait with timer cleanup: unlike fire-and-forget sleepMs races,
+// the timer is always cleared, so connect/probe attempts under a reconnect
+// storm cannot pin isolates awake (a past 1101 contributor).
+function withTimeout(promise, ms, label) {
+    let timer = null;
+    const gate = new Promise((_, rej) => {
+        timer = setTimeout(() => {
+            try {
+                rej(new Error(label || "timeout"));
+            } catch (e) {}
+        }, ms);
+    });
+    return Promise.race([promise, gate]).finally(() => {
+        try {
+            if (timer) clearTimeout(timer);
+        } catch (e) {}
+    });
+}
 let uuidUsage = new Map();
 let activeConns = new Map();
 let activeDeviceId = "";
@@ -98,9 +194,10 @@ let backupIpCacheTime = 0;
 async function deployWorkerToCloudflare(accountId, apiToken, workerName, code) {
     let currentBindings = [];
     try {
-        const settingsRes = await fetch(
+        const settingsRes = await fetchT(
             `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${encodeURIComponent(workerName)}/settings`,
             { headers: { Authorization: `Bearer ${apiToken}` } },
+            30000,
         );
         const settingsJson = await settingsRes.json();
         if (settingsJson.success && settingsJson.result?.bindings) {
@@ -126,13 +223,14 @@ async function deployWorkerToCloudflare(accountId, apiToken, workerName, code) {
         "_worker.js",
     );
 
-    return await fetch(
+    return await fetchT(
         `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${encodeURIComponent(workerName)}`,
         {
             method: "PUT",
             headers: { Authorization: `Bearer ${apiToken}` },
             body: form,
         },
+        30000,
     );
 }
 
@@ -312,8 +410,21 @@ function extractAuthKey(request, data) {
 }
 
 function isAuthorized(request, data) {
-    const key = extractAuthKey(request, data);
-    return key === sysConfig.masterKey || isPanelApiKey(key);
+    try {
+        const ip =
+            (request &&
+                request.headers &&
+                request.headers.get("cf-connecting-ip")) ||
+            "Unknown";
+        if (authBlocked(ip)) return false;
+        const key = extractAuthKey(request, data);
+        const ok =
+            key === sysConfig.masterKey || isPanelApiKey(key);
+        if (!ok) authFail(ip);
+        return ok;
+    } catch (e) {
+        return false;
+    }
 }
 
 function generateApiKey(name) {
@@ -336,6 +447,8 @@ function trackUsage(uuid, bytes, env, ctx) {
         sysUsageCache.users[uuid] = {
             reqs: 0,
             dReqs: 0,
+            bytes: 0,
+            dBytes: 0,
             lastDay: new Date().toISOString().split("T")[0],
         };
 
@@ -343,14 +456,26 @@ function trackUsage(uuid, bytes, env, ctx) {
     let today = new Date().toISOString().split("T")[0];
     if (u.lastDay !== today) {
         u.dReqs = 0;
+        u.dBytes = 0;
         u.lastDay = today;
     }
     if (u.reqs === undefined) u.reqs = 0;
     if (u.dReqs === undefined) u.dReqs = 0;
+    // One-time migration for rows written before byte accounting existed.
+    if (typeof u.bytes !== "number" || u.bytes < 0)
+        u.bytes = Math.floor((u.reqs || 0) * REQ_BYTES_EST);
+    if (typeof u.dBytes !== "number" || u.dBytes < 0)
+        u.dBytes =
+            u.lastDay === today
+                ? Math.floor((u.dReqs || 0) * REQ_BYTES_EST)
+                : 0;
 
     if (bytes === 0) {
         u.reqs += 1;
         u.dReqs += 1;
+    } else if (typeof bytes === "number" && bytes > 0) {
+        u.bytes += Math.floor(bytes);
+        u.dBytes += Math.floor(bytes);
     }
 
     const now = Date.now();
@@ -369,10 +494,16 @@ function trackUsage(uuid, bytes, env, ctx) {
                         } else if (
                             sysU &&
                             u.limitTotalReq &&
-                            sysU.reqs >= u.limitTotalReq
+                            usageTotalBytes(sysU) >=
+                                limitReqToBytes(u.limitTotalReq)
                         ) {
-                            let usedGB = (sysU.reqs / 6000).toFixed(2);
-                            let limitGB = (u.limitTotalReq / 6000).toFixed(2);
+                            let usedGB = (
+                                usageTotalBytes(sysU) / 1073741824
+                            ).toFixed(2);
+                            let limitGB = (
+                                limitReqToBytes(u.limitTotalReq) /
+                                1073741824
+                            ).toFixed(2);
                             reason = `Traffic limit exceeded (${usedGB}GB / ${limitGB}GB)`;
                         }
                         if (reason) {
@@ -395,7 +526,7 @@ function trackUsage(uuid, bytes, env, ctx) {
                                 const notifyChatId =
                                     sysConfig.tgAdminId || sysConfig.tgChatId;
                                 ctx?.waitUntil(
-                                    fetch(
+                                    fetchT(
                                         `https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`,
                                         {
                                             method: "POST",
@@ -441,8 +572,45 @@ export default {
     async fetch(request, env, ctx) {
         try {
             if (!isolateStartTime) isolateStartTime = Date.now();
+            try {
+                INFLIGHT_HTTP++;
+            } catch (e) {}
+            try {
+                if (ctx && typeof ctx.waitUntil === "function") {
+                    ctx.waitUntil(
+                        Promise.resolve().then(() => {
+                            try {
+                                INFLIGHT_HTTP = Math.max(
+                                    0,
+                                    INFLIGHT_HTTP - 1,
+                                );
+                            } catch (e) {}
+                        }),
+                    );
+                }
+            } catch (e) {}
             if (configRegistry.size > 10000) { configRegistry.clear(); trojanHashCache.clear(); }
             await loadSysConfig(env, ctx);
+            // Background self-healing sweep (throttled): dead-relay probes
+            // + graveyard re-probes run in waitUntil, never blocking responses.
+            try {
+                const nowRs = Date.now();
+                if (nowRs - lastRelaySweep > 60000) {
+                    lastRelaySweep = nowRs;
+                    if (ctx && typeof ctx.waitUntil === "function") {
+                        ctx.waitUntil(
+                            (async () => {
+                                try {
+                                    await probeDeadRelays(env);
+                                } catch (e) {}
+                                try {
+                                    await probeGraveyard(env);
+                                } catch (e) {}
+                            })(),
+                        );
+                    }
+                }
+            } catch (e) {}
             activeDeviceId =
                 sysConfig.deviceId || generateHardwareId(sysConfig.apiRoute);
 
@@ -496,11 +664,31 @@ export default {
                 return serveMaintenancePage(request, url);
             }
 
+            // Maintenance mode (sysConfig.maintenanceMode): admin APIs stay
+            // open, already-open tunnels are unaffected (they are upgraded),
+            // but new tunnels and sub refreshes get a polite 503.
+            // Toggle by POSTing {"key":...,"config":{"maintenanceMode":true}}
+            // to /<apiRoute>/api/sync (merged, survives dashboard syncs).
+            if (
+                sysConfig.maintenanceMode &&
+                (isTelemetryStream || reqPath === routes.data)
+            ) {
+                if (isTelemetryStream)
+                    return new Response(null, { status: 503 });
+                return new Response(
+                    "Maintenance in progress, retry later",
+                    {
+                        status: 503,
+                        headers: { "Retry-After": "120" },
+                    },
+                );
+            }
+
             if (!isTelemetryStream) {
                 if (reqPath === routes.dash) {
                     const dashboardUrl = env.DASHBOARD_URL || 'https://raw.githubusercontent.com/itsyebekhe/nahan/main/dashboard.html';
                     try {
-                        const resp = await fetch(dashboardUrl);
+                        const resp = await fetchT(dashboardUrl);
                         let html = await resp.text();
                         html = html.replace(/__CURRENT_VERSION__/g, CURRENT_VERSION);
                         if (env.IOT_DB !== undefined) {
@@ -637,7 +825,7 @@ export default {
                         if (isValidUser) {
                             const subscriptionUrl = env.SUBSCRIPTION_URL || 'https://raw.githubusercontent.com/itsyebekhe/nahan/main/subscription.html';
                             try {
-                                const resp = await fetch(subscriptionUrl);
+                                const resp = await fetchT(subscriptionUrl);
                                 let html = await resp.text();
                                 // Compute dynamic values
                                 const idClean = targetUser.id.replace(/-/g, '').toLowerCase();
@@ -647,12 +835,16 @@ export default {
                                 const dailyReqs = sysU.lastDay === todayDate ? (sysU.dReqs || 0) : 0;
                                 const limitTotal = targetUser.limitTotalReq || 0;
                                 const limitDaily = targetUser.limitDailyReq || 0;
-                                const totalGb = (totalReqs / 6000).toFixed(2);
-                                const limitTotalGb = limitTotal ? (limitTotal / 6000).toFixed(2) : '9999';
-                                const dailyGb = (dailyReqs / 6000).toFixed(2);
-                                const limitDailyGb = limitDaily ? (limitDaily / 6000).toFixed(2) : '9999';
-                                const totalPercent = limitTotal ? Math.min(100, (totalReqs / limitTotal) * 100).toFixed(1) : '0';
-                                const dailyPercent = limitDaily ? Math.min(100, (dailyReqs / limitDaily) * 100).toFixed(1) : '0';
+                                const totalBytesUsed = usageTotalBytes(sysU);
+                                const dailyBytesUsed = usageDailyBytes(sysU, todayDate);
+                                const limitTotalBytes = limitReqToBytes(limitTotal);
+                                const limitDailyBytes = limitReqToBytes(limitDaily);
+                                const totalGb = (totalBytesUsed / 1073741824).toFixed(2);
+                                const limitTotalGb = limitTotal ? (limitTotalBytes / 1073741824).toFixed(2) : '9999';
+                                const dailyGb = (dailyBytesUsed / 1073741824).toFixed(2);
+                                const limitDailyGb = limitDaily ? (limitDailyBytes / 1073741824).toFixed(2) : '9999';
+                                const totalPercent = limitTotal ? Math.min(100, (totalBytesUsed / limitTotalBytes) * 100).toFixed(1) : '0';
+                                const dailyPercent = limitDaily ? Math.min(100, (dailyBytesUsed / limitDailyBytes) * 100).toFixed(1) : '0';
                                 let expiryDateTxt = '2099-01-01';
                                 let isExpired = false;
                                 if (targetUser.expiryMs) {
@@ -662,8 +854,8 @@ export default {
                                 let statusCode = 'active';
                                 if (targetUser.isPaused) statusCode = 'paused';
                                 else if (isExpired) statusCode = 'expired';
-                                else if (limitTotal && totalReqs >= limitTotal) statusCode = 'limit';
-                                else if (limitDaily && dailyReqs >= limitDaily) statusCode = 'dailyLimit';
+                                else if (limitTotal && totalBytesUsed >= limitTotalBytes) statusCode = 'limit';
+                                else if (limitDaily && dailyBytesUsed >= limitDailyBytes) statusCode = 'dailyLimit';
                                 let cleanUrl = new URL(url.href);
                                 let panelUrlToUse = sysConfig.customPanelUrl;
                                 if (targetUser.userPanelUrl && targetUser.userPanelUrl.trim()) panelUrlToUse = targetUser.userPanelUrl.trim();
@@ -721,6 +913,21 @@ export default {
                         );
                     }
 
+                    // Breaker L2: shed client sub refreshes under extreme
+                    // load (browsers still get the info page above, open
+                    // tunnels are unaffected).
+                    try {
+                        if (breakerLevel() >= 2 && !isRealBrowser) {
+                            return new Response(
+                                "Server busy, retry later",
+                                {
+                                    status: 429,
+                                    headers: { "Retry-After": "60" },
+                                },
+                            );
+                        }
+                    } catch (e) {}
+
                     const allowInsecure =
                         url.searchParams.get("insecure") === "true" ||
                         url.searchParams.get("allowInsecure") === "true" ||
@@ -758,12 +965,8 @@ export default {
                             expiryMs = sysConfig.expiryMs || 0;
                         }
 
-                        let usedBytes = Math.floor(
-                            totalReqs * (1073741824 / 6000),
-                        );
-                        let limitBytes = Math.floor(
-                            limitTotal * (1073741824 / 6000),
-                        );
+                        let usedBytes = usageTotalBytes(sysU);
+                        let limitBytes = limitReqToBytes(limitTotal);
                         let expireSec = expiryMs
                             ? Math.floor(expiryMs / 1000)
                             : 0;
@@ -902,6 +1105,23 @@ export default {
             if (isTelemetryStream) {
                 if (sysConfig.isPaused)
                     return new Response(null, { status: 503 });
+                // Reconnect-storm backoff before the handshake stacks up.
+                try {
+                    const wip =
+                        request.headers.get("cf-connecting-ip") || "unknown";
+                    const wr = wsRateCheck(wip);
+                    if (wr === "refuse")
+                        return new Response("Too many requests", {
+                            status: 429,
+                            headers: { "Retry-After": "60" },
+                        });
+                    if (wr === "tarpit") await sleepMs(1500);
+                } catch (e) {}
+                // Breaker L2: slow down reconnect storms instead of
+                // stacking more handshakes onto a saturated isolate.
+                try {
+                    if (breakerLevel() >= 2) await sleepMs(1000);
+                } catch (e) {}
                 let wsRelayIdx = -1;
                 try {
                     const riParam = url.searchParams.get("ri");
@@ -943,7 +1163,7 @@ export default {
                     .trim();
                 let remoteVer = null;
                 try {
-                    const res = await fetch(`https://raw.githubusercontent.com/${repo}/main/version`);
+                    const res = await fetchT(`https://raw.githubusercontent.com/${repo}/main/version`);
                     if (res.ok) {
                         remoteVer = (await res.text()).trim();
                     }
@@ -951,11 +1171,11 @@ export default {
                 
                 if (remoteVer && cmpVersions(CURRENT_VERSION, remoteVer) < 0) {
                     try {
-                        let res = await fetch(`https://raw.githubusercontent.com/${repo}/main/_worker.encode.js`);
+                        let res = await fetchT(`https://raw.githubusercontent.com/${repo}/main/_worker.encode.js`);
                         if (!res.ok) {
-                            res = await fetch(`https://raw.githubusercontent.com/${repo}/main/_worker.encoded.js`);
+                            res = await fetchT(`https://raw.githubusercontent.com/${repo}/main/_worker.encoded.js`);
                             if (!res.ok) {
-                                res = await fetch(`https://raw.githubusercontent.com/${repo}/main/_worker.js`);
+                                res = await fetchT(`https://raw.githubusercontent.com/${repo}/main/_worker.js`);
                             }
                         }
                         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -980,7 +1200,7 @@ export default {
                                             const parsed = new URL(cleanUrl);
                                             const targetUrl = `${parsed.protocol}//${parsed.host}/${encodeURI(sysConfig.apiRoute)}/api/update`;
                                             ctx?.waitUntil(
-                                                fetch(targetUrl, {
+                                                fetchT(targetUrl, {
                                                     method: "POST",
                                                     headers: { "Content-Type": "application/json" },
                                                     body: JSON.stringify({
@@ -1007,6 +1227,13 @@ export default {
 };
 
 async function serveMaintenancePage(request, url) {
+    // Breaker L1: skip the origin fetch under load ( shards of ubuntu/docker
+    // fetches during floods kept isolates busy with zero user value).
+    try {
+        if (breakerLevel() >= 1) {
+            return new Response("Not Found", { status: 404 });
+        }
+    } catch (e) {}
     let fakeList = sysConfig.maintenanceHost
         ? sysConfig.maintenanceHost
               .split(",")
@@ -1037,7 +1264,7 @@ async function serveMaintenancePage(request, url) {
         };
         if (request.method !== "GET" && request.method !== "HEAD")
             fetchInit.body = request.body;
-        return await fetch(new Request(targetUrl.toString(), fetchInit));
+        return await fetchT(new Request(targetUrl.toString(), fetchInit));
     } catch (e) {
         return new Response("Not Found", { status: 404 });
     }
@@ -1157,7 +1384,7 @@ async function fetchCloudflareUsage(accountId, apiToken) {
         const query = `query GetDailyUsage($accountId: String!, $start: ISO8601DateTime!) { viewer { accounts(filter: {accountTag: $accountId}) { workersInvocationsAdaptive(limit: 1, filter: { datetime_geq: $start }) { sum { requests } } } } }`;
         const variables = { accountId: accountId, start: currentDate };
 
-        const res = await fetch(
+        const res = await fetchT(
             "https://api.cloudflare.com/client/v4/graphql",
             {
                 method: "POST",
@@ -1270,7 +1497,7 @@ async function sendTelegramMessage(request, type, hostName) {
     const tgUrl = `https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`;
     const notifyChatId = sysConfig.tgAdminId || sysConfig.tgChatId;
     try {
-        await fetch(tgUrl, {
+        await fetchT(tgUrl, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -1345,7 +1572,19 @@ async function handleUsersApi(request, env, ctx) {
             bodyKey === sysConfig.masterKey ||
             isPanelApiKey(authKey) ||
             isPanelApiKey(bodyKey);
+        const gateIp =
+            request.headers.get("cf-connecting-ip") || "Unknown";
+        if (authBlocked(gateIp)) {
+            return new Response(
+                JSON.stringify({ success: false, error: "Too many attempts" }),
+                {
+                    status: 429,
+                    headers: { "Content-Type": "application/json" },
+                },
+            );
+        }
         if (!isAuth) {
+            authFail(gateIp);
             return new Response(
                 JSON.stringify({ success: false, error: "Unauthorized" }),
                 {
@@ -1374,12 +1613,8 @@ async function handleUsersApi(request, env, ctx) {
                     dReqs: 0,
                     lastDay: "",
                 };
-                const usedBytes = Math.floor(
-                    (sysU.reqs || 0) * (1073741824 / 6000),
-                );
-                const limitBytes = u.limitTotalReq
-                    ? Math.floor(u.limitTotalReq * (1073741824 / 6000))
-                    : 0;
+                const usedBytes = usageTotalBytes(sysU);
+                const limitBytes = limitReqToBytes(u.limitTotalReq);
                 const isExpired = u.expiryMs && Date.now() > u.expiryMs;
                 let status = "active";
                 if (u.isPaused && u.disabledReason) status = "auto-disabled";
@@ -1426,12 +1661,8 @@ async function handleUsersApi(request, env, ctx) {
                 dReqs: 0,
                 lastDay: "",
             };
-            const usedBytes = Math.floor(
-                (sysU.reqs || 0) * (1073741824 / 6000),
-            );
-            const limitBytes = u.limitTotalReq
-                ? Math.floor(u.limitTotalReq * (1073741824 / 6000))
-                : 0;
+            const usedBytes = usageTotalBytes(sysU);
+            const limitBytes = limitReqToBytes(u.limitTotalReq);
             const isExpired = u.expiryMs && Date.now() > u.expiryMs;
             let status = "active";
             if (u.isPaused && u.disabledReason) status = "auto-disabled";
@@ -1732,7 +1963,19 @@ async function handleStatsApi(request, env) {
             authHeader.replace("Bearer ", "") ||
             url.searchParams.get("key") ||
             "";
+        const statsGateIp =
+            request.headers.get("cf-connecting-ip") || "Unknown";
+        if (authBlocked(statsGateIp)) {
+            return new Response(
+                JSON.stringify({ success: false, error: "Too many attempts" }),
+                {
+                    status: 429,
+                    headers: { "Content-Type": "application/json" },
+                },
+            );
+        }
         if (authKey !== sysConfig.masterKey && !isPanelApiKey(authKey)) {
+            authFail(statsGateIp);
             return new Response(
                 JSON.stringify({ success: false, error: "Unauthorized" }),
                 {
@@ -1759,6 +2002,8 @@ async function handleStatsApi(request, env) {
 
         let totalTrafficReqs = 0;
         let dailyTrafficReqs = 0;
+        let totalTrafficBytes = 0;
+        let dailyTrafficBytes = 0;
         const todayDate = new Date().toISOString().split("T")[0];
         users.forEach((u) => {
             const idClean = u.id.replace(/-/g, "").toLowerCase();
@@ -1769,6 +2014,8 @@ async function handleStatsApi(request, env) {
             };
             totalTrafficReqs += sysU.reqs || 0;
             if (sysU.lastDay === todayDate) dailyTrafficReqs += sysU.dReqs || 0;
+            totalTrafficBytes += usageTotalBytes(sysU);
+            dailyTrafficBytes += usageDailyBytes(sysU, todayDate);
         });
 
         
@@ -1791,16 +2038,20 @@ async function handleStatsApi(request, env) {
                     },
                     traffic: {
                         totalRequests: totalTrafficReqs,
-                        totalGB: (totalTrafficReqs / 6000).toFixed(2),
+                        totalGB: (totalTrafficBytes / 1073741824).toFixed(2),
                         dailyRequests: dailyTrafficReqs,
-                        dailyGB: (dailyTrafficReqs / 6000).toFixed(2),
+                        dailyGB: (dailyTrafficBytes / 1073741824).toFixed(2),
                     },
                     usage: usageData,
-                system: {
+                    system: {
                         uptimeSeconds: upSeconds,
                         activeConnections,
                         version: CURRENT_VERSION,
                         isPaused: sysConfig.isPaused || false,
+                        security: {
+                            usingDefaultKey:
+                                sysConfig.masterKey === "admin",
+                        },
                     },
                 },
             }),
@@ -1835,7 +2086,19 @@ async function handleUpdateApi(request, env, ctx) {
             return new Response("405", { status: 405 });
         const data = await request.json();
         const deployKey = extractAuthKey(request, data);
+        const deployGateIp =
+            request.headers.get("cf-connecting-ip") || "Unknown";
+        if (authBlocked(deployGateIp)) {
+            return new Response(
+                JSON.stringify({ success: false, error: "Too many attempts" }),
+                {
+                    status: 429,
+                    headers: { "Content-Type": "application/json" },
+                },
+            );
+        }
         if (deployKey !== sysConfig.masterKey) {
+            authFail(deployGateIp);
             return new Response(
                 JSON.stringify({ success: false, error: "Unauthorized" }),
                 {
@@ -1855,7 +2118,7 @@ async function handleUpdateApi(request, env, ctx) {
         if (data.action === "check") {
             let remoteVer = null;
             try {
-                const res = await fetch(
+                const res = await fetchT(
                     `https://raw.githubusercontent.com/${repo}/main/version`,
                 );
                 if (res.ok) {
@@ -1865,15 +2128,15 @@ async function handleUpdateApi(request, env, ctx) {
             } catch (e) {}
             if (!remoteVer) {
                 try {
-                    let res = await fetch(
+                    let res = await fetchT(
                         `https://raw.githubusercontent.com/${repo}/main/_worker.encode.js`,
                     );
                     if (!res.ok) {
-                        res = await fetch(
+                        res = await fetchT(
                             `https://raw.githubusercontent.com/${repo}/main/_worker.encoded.js`,
                         );
                         if (!res.ok) {
-                            res = await fetch(
+                            res = await fetchT(
                                 `https://raw.githubusercontent.com/${repo}/main/_worker.js`,
                             );
                         }
@@ -1914,6 +2177,22 @@ async function handleUpdateApi(request, env, ctx) {
         }
 
         if (data.action === "deploy") {
+            // Remote-code-execution gate: deploying worker code with only
+            // the panel key is disabled unless the operator explicitly opts
+            // in (POST {"key":...,"config":{"allowRemoteDeploy":true}} to
+            // /api/sync). Version *check* above stays available.
+            if (sysConfig.allowRemoteDeploy !== true) {
+                return new Response(
+                    JSON.stringify({
+                        success: false,
+                        error: "Remote deploy is disabled. Enable allowRemoteDeploy in config to use it.",
+                    }),
+                    {
+                        status: 403,
+                        headers: { "Content-Type": "application/json" },
+                    },
+                );
+            }
             if (!accountId || !apiToken || !workerName) {
                 return new Response(
                     JSON.stringify({
@@ -1932,15 +2211,15 @@ async function handleUpdateApi(request, env, ctx) {
             let finalCodeToDeploy = data.code;
             if (!finalCodeToDeploy) {
                 try {
-                    let res = await fetch(
+                    let res = await fetchT(
                         `https://raw.githubusercontent.com/${repo}/main/_worker.encode.js`,
                     );
                     if (!res.ok) {
-                        res = await fetch(
+                        res = await fetchT(
                             `https://raw.githubusercontent.com/${repo}/main/_worker.encoded.js`,
                         );
                         if (!res.ok) {
-                            res = await fetch(
+                            res = await fetchT(
                                 `https://raw.githubusercontent.com/${repo}/main/_worker.js`,
                             );
                         }
@@ -1969,7 +2248,7 @@ async function handleUpdateApi(request, env, ctx) {
                     newVersion = versionMatch[1];
                 } else {
                     try {
-                        const vRes = await fetch(
+                        const vRes = await fetchT(
                             `https://raw.githubusercontent.com/${repo}/main/version`,
                         );
                         if (vRes.ok) {
@@ -2026,7 +2305,7 @@ async function handleUpdateApi(request, env, ctx) {
                                 const parsed = new URL(cleanUrl);
                                 const targetUrl = `${parsed.protocol}//${parsed.host}/${encodeURI(sysConfig.apiRoute)}/api/update`;
                                 ctx?.waitUntil(
-                                    fetch(targetUrl, {
+                                    fetchT(targetUrl, {
                                         method: "POST",
                                         headers: { "Content-Type": "application/json" },
                                         body: JSON.stringify({
@@ -2058,7 +2337,7 @@ async function handleUpdateApi(request, env, ctx) {
                     const notifyChatId =
                         sysConfig.tgAdminId || sysConfig.tgChatId;
                     ctx?.waitUntil(
-                        fetch(
+                        fetchT(
                             `https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`,
                             {
                                 method: "POST",
@@ -2114,7 +2393,19 @@ async function handleApiKeys(request, env, ctx) {
         const method = request.method;
 
         const authKey = extractAuthKey(request, null);
+        const keysGateIp =
+            request.headers.get("cf-connecting-ip") || "Unknown";
+        if (authBlocked(keysGateIp)) {
+            return new Response(
+                JSON.stringify({ success: false, error: "Too many attempts" }),
+                {
+                    status: 429,
+                    headers: { "Content-Type": "application/json" },
+                },
+            );
+        }
         if (authKey !== sysConfig.masterKey) {
+            authFail(keysGateIp);
             return new Response(
                 JSON.stringify({
                     success: false,
@@ -2232,10 +2523,20 @@ async function handleAuth(request, hostName, ctx, env) {
     try {
         const data = await request.json();
         const ip = request.headers.get("cf-connecting-ip") || "Unknown";
+        if (authBlocked(ip)) {
+            return new Response(
+                JSON.stringify({
+                    success: false,
+                    error: "Too many attempts, try later",
+                }),
+                { status: 429 },
+            );
+        }
         const loginKey = data.key || "";
         const isKeyAuth =
             loginKey === sysConfig.masterKey || isPanelApiKey(loginKey);
         if (isKeyAuth) {
+            authClear(ip);
             if (isPanelApiKey(loginKey)) {
                 const apiKeyEntry = (sysConfig.panelApiKeys || []).find(
                     (k) => k.key === loginKey,
@@ -2296,7 +2597,7 @@ async function handleAuth(request, hostName, ctx, env) {
                         ts: Date.now(),
                     };
                     ctx?.waitUntil(
-                        fetch(
+                        fetchT(
                             `${hubUrl}/${encodeURI(sysConfig.apiRoute)}/tg/sync_panel`,
                             {
                                 method: "POST",
@@ -2377,6 +2678,7 @@ async function handleAuth(request, hostName, ctx, env) {
         ctx?.waitUntil(
             logActivity(env, "Auth Failed", `Failed login attempt from ${ip}`),
         );
+        authFail(ip);
         if (ctx)
             ctx.waitUntil(
                 sendTelegramMessage(
@@ -2398,6 +2700,17 @@ async function handleAuth(request, hostName, ctx, env) {
 async function handleConfigSync(request, env, ctx) {
     try {
         const data = await request.json();
+        const syncGateIp =
+            request.headers.get("cf-connecting-ip") || "Unknown";
+        if (authBlocked(syncGateIp)) {
+            return new Response(
+                JSON.stringify({
+                    success: false,
+                    error: "Too many attempts",
+                }),
+                { status: 429 },
+            );
+        }
         const isAuthSync =
             data.key === sysConfig.masterKey ||
             (data.oldKey && data.oldKey === sysConfig.masterKey) ||
@@ -2407,7 +2720,8 @@ async function handleConfigSync(request, env, ctx) {
                 data.config &&
                 data.config.masterKey &&
                 data.config.masterKey === sysConfig.masterKey);
-        if (!isAuthSync)
+        if (!isAuthSync) {
+            authFail(syncGateIp);
             return new Response(
                 JSON.stringify({
                     success: false,
@@ -2415,6 +2729,7 @@ async function handleConfigSync(request, env, ctx) {
                 }),
                 { status: 401 },
             );
+        }
         if (!env.IOT_DB)
             return new Response(
                 JSON.stringify({ success: false, msg: "DB Error" }),
@@ -2513,7 +2828,7 @@ async function handleConfigSync(request, env, ctx) {
                 nodes.forEach((node) => {
                     if (node !== currentHost) {
                         ctx?.waitUntil(
-                            fetch(
+                            fetchT(
                                 `https://${node}/${encodeURI(nextConfig.apiRoute)}/api/sync`,
                                 {
                                     method: "POST",
@@ -2542,7 +2857,7 @@ async function handleConfigSync(request, env, ctx) {
                             const parsed = new URL(cleanUrl);
                             if (parsed.hostname !== currentHost) {
                                 ctx?.waitUntil(
-                                    fetch(
+                                    fetchT(
                                         `${parsed.protocol}//${parsed.host}/${encodeURI(nextConfig.apiRoute)}/api/sync`,
                                         {
                                             method: "POST",
@@ -2567,7 +2882,7 @@ async function handleConfigSync(request, env, ctx) {
         if (nextConfig.tgToken && ctx) {
             const hookUrl = `https://${new URL(request.url).hostname}/${encodeURI(nextConfig.apiRoute)}/tg`;
             ctx.waitUntil(
-                fetch(
+                fetchT(
                     `https://api.telegram.org/bot${nextConfig.tgToken}/setWebhook`,
                     {
                         method: "POST",
@@ -2975,7 +3290,7 @@ async function remotePanelFetch(panel, method, path, body = null) {
             headers: { "Content-Type": "application/json" },
         };
         if (body) options.body = JSON.stringify(body);
-        const res = await fetch(url, {
+        const res = await fetchT(url, {
             ...options,
             signal: AbortSignal.timeout(8000),
         });
@@ -3064,7 +3379,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 update.callback_query?.message?.chat?.id ||
                 update.message?.chat?.id;
             if (chatId) {
-                await fetch(`${tgApi}/sendMessage`, {
+                await fetchT(`${tgApi}/sendMessage`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
@@ -3130,7 +3445,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
         ) => {
             let res;
             if (messageId) {
-                res = await fetch(`${tgApi}/editMessageText`, {
+                res = await fetchT(`${tgApi}/editMessageText`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
@@ -3152,7 +3467,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         return res;
                 } catch (e) {}
             }
-            res = await fetch(`${tgApi}/sendMessage`, {
+            res = await fetchT(`${tgApi}/sendMessage`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -3373,9 +3688,9 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             const limitDailyTxt = u.limitDailyReq
                 ? `${u.limitDailyReq}`
                 : t("unlimited");
-            const usedGB = (userReqs / 6000).toFixed(2);
+            const usedGB = (usageTotalBytes(sysU) / 1073741824).toFixed(2);
             const limitGB = u.limitTotalReq
-                ? (u.limitTotalReq / 6000).toFixed(2)
+                ? (limitReqToBytes(u.limitTotalReq) / 1073741824).toFixed(2)
                 : t("unlimited");
 
             let expTxt = t("unlimited");
@@ -3508,7 +3823,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
 
             if (chatId) {
                 if (!isAuthorized) {
-                    await fetch(`${tgApi}/answerCallbackQuery`, {
+                    await fetchT(`${tgApi}/answerCallbackQuery`, {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({
@@ -4014,6 +4329,8 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     await sendOrEdit(chatId, dashText, kb, messageId);
                 } else if (data === "sys_stats") {
                     let users, totalReqs, dailyReqs;
+                    let totalBytesSum = 0,
+                        dailyBytesSum = 0;
                     if (isRemotePanel) {
                         const statsRes =
                             await fetchRemotePanelStats(activePanel);
@@ -4047,6 +4364,8 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             totalReqs += sysU.reqs || 0;
                             if (sysU.lastDay === todayDate)
                                 dailyReqs += sysU.dReqs || 0;
+                            totalBytesSum += usageTotalBytes(sysU);
+                            dailyBytesSum += usageDailyBytes(sysU, todayDate);
                         });
                     }
                     let statsText = `📈 **${t("stats_title")}**\n`;
@@ -4054,8 +4373,8 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     statsText += `📌 **${t("current_panel")}**: ${activePanel.isLocal ? "🏠" : "🌐"} ${activePanel.name}\n`;
                     statsText += `━━━━━━━━━━━━━━━━\n`;
                     statsText += `👥 **${t("dash_total")}**: ${Array.isArray(users) ? users.length : "N/A"}\n`;
-                    statsText += `📊 **${t("total_traffic")}**: ${(totalReqs / 6000).toFixed(2)} GB\n`;
-                    statsText += `📅 **${t("daily_traffic")}**: ${(dailyReqs / 6000).toFixed(2)} GB\n`;
+                    statsText += `📊 **${t("total_traffic")}**: ${(totalBytesSum / 1073741824).toFixed(2)} GB\n`;
+                    statsText += `📅 **${t("daily_traffic")}**: ${(dailyBytesSum / 1073741824).toFixed(2)} GB\n`;
                     if (!isRemotePanel) {
                         const upSeconds = Math.floor(
                             (Date.now() - isolateStartTime) / 1000,
@@ -4214,16 +4533,20 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         if (!sysUsageCache) sysUsageCache = { users: {} };
                         if (!sysUsageCache.users) sysUsageCache.users = {};
                         const uuidClean = uuid.replace(/-/g, "").toLowerCase();
-                        if (sysUsageCache.users[uuidClean]) {
-                            sysUsageCache.users[uuidClean].reqs = 0;
-                            sysUsageCache.users[uuidClean].dReqs = 0;
-                        } else {
-                            sysUsageCache.users[uuidClean] = {
-                                reqs: 0,
-                                dReqs: 0,
-                                lastDay: new Date().toISOString().split("T")[0],
-                            };
-                        }
+            if (sysUsageCache.users[uuidClean]) {
+                sysUsageCache.users[uuidClean].reqs = 0;
+                sysUsageCache.users[uuidClean].dReqs = 0;
+                sysUsageCache.users[uuidClean].bytes = 0;
+                sysUsageCache.users[uuidClean].dBytes = 0;
+            } else {
+                sysUsageCache.users[uuidClean] = {
+                    reqs: 0,
+                    dReqs: 0,
+                    bytes: 0,
+                    dBytes: 0,
+                    lastDay: new Date().toISOString().split("T")[0],
+                };
+            }
                         await cachedD1Put(
                             env,
                             "sys_usage",
@@ -4340,7 +4663,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     );
                 } else if (data === "get_sub_link") {
                     const subUrl = `https://${hostName}/${sysConfig.apiRoute}`;
-                    await fetch(`${tgApi}/sendMessage`, {
+                    await fetchT(`${tgApi}/sendMessage`, {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({
@@ -5055,7 +5378,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 }
 
                 ctx?.waitUntil(
-                    fetch(`${tgApi}/answerCallbackQuery`, {
+                    fetchT(`${tgApi}/answerCallbackQuery`, {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({
@@ -6053,6 +6376,823 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
     }
 }
 
+// ==== Self-healing relays (Sepidar-grade, adapted to nahan's model) ====
+// Nahan relays are plain tokens (IP[:port][#Name]) in per-user proxyIp +
+// global backupRelay/customRelay. A dead relay hangs WS handshakes and can
+// pile up isolates -> Cloudflare loadShed -> 1101 for everyone.
+// Layers: passive fail-streak quarantine (5 fails -> 15min skip) + active
+// TLS-probe rounds (10min, 6 relays) + graveyard burial with slow re-probe
+// (30min) and auto-resurrect after 3 healthy probes. Kill switch:
+// sysConfig.autoPruneRelays === false/0 freezes burial+probing.
+const RELAY_Q = new Map(); // key "host|port" -> { fail, until, probeFail }
+const RELAY_QUARANTINE_MS = 15 * 60 * 1000;
+const RELAY_FAIL_STREAK = 5;
+// Ports where a TLS handshake is expected; other relay ports are liveness
+// checked by TCP open only (a TLS probe there would false-positive).
+const RELAY_TLS_PORTS = new Set([
+    "443",
+    "2053",
+    "2083",
+    "2087",
+    "2096",
+    "8443",
+]);
+const PROBE_INTERVAL_MS = 10 * 60 * 1000;
+const PROBE_MAX_PER_ROUND = 6;
+const PROBE_FAIL_LIMIT = 3;
+const GRAVE_INTERVAL_MS = 30 * 60 * 1000;
+const GRAVE_MAX_PER_ROUND = 3;
+const GRAVE_HEALTHY_NEED = 3;
+const FLAP_WINDOW_MS = 24 * 60 * 60 * 1000;
+const FLAP_LIMIT = 3;
+let lastRelaySweep = 0;
+let lastProbeTs = 0;
+let lastGraveTs = 0;
+let lastHealthSave = 0;
+function relayKeyOf(tok) {
+    try {
+        let s = String(tok || "").trim();
+        if (!s) return null;
+        s = s.replace(/^[a-zA-Z]+:\/\//, "");
+        if (s.includes("@")) s = s.substring(s.lastIndexOf("@") + 1);
+        const hi = s.indexOf("#");
+        if (hi !== -1) s = s.substring(0, hi).trim();
+        if (!s) return null;
+        if (s.charAt(0) === "[") {
+            const ci = s.indexOf("]");
+            if (ci === -1) return null;
+            const host = s.substring(1, ci).toLowerCase();
+            let port = 443;
+            if (s.length > ci + 1 && s.charAt(ci + 1) === ":") {
+                const p = parseInt(s.substring(ci + 2), 10);
+                if (!isNaN(p) && p >= 1 && p <= 65535) port = p;
+            }
+            if (!host) return null;
+            return { host, port, key: host + "|" + port };
+        }
+        const firstColon = s.indexOf(":");
+        const lastColon = s.lastIndexOf(":");
+        if (firstColon !== -1 && firstColon !== lastColon) {
+            const host = s.toLowerCase();
+            if (!host || host.length > 253) return null;
+            return { host, port: 443, key: host + "|443" };
+        }
+        let host = s;
+        let port = 443;
+        if (lastColon !== -1) {
+            const tail = s.substring(lastColon + 1).trim();
+            if (/^\d+$/.test(tail)) {
+                const p = parseInt(tail, 10);
+                if (!isNaN(p) && p >= 1 && p <= 65535) {
+                    host = s.substring(0, lastColon);
+                    port = p;
+                } else {
+                    return null;
+                }
+            } else {
+                return null;
+            }
+        }
+        host = host.toLowerCase();
+        if (!host || host.length > 253) return null;
+        if (!/^[a-z0-9.\-]+$/.test(host)) return null;
+        return { host, port, key: host + "|" + port };
+    } catch (e) {
+        return null;
+    }
+}
+function isRelayQuarantined(host, port) {
+    try {
+        const e = RELAY_Q.get(
+            String(host || "").toLowerCase() + "|" + (port || 443),
+        );
+        if (!e || !e.until) return false;
+        if (Date.now() > e.until) {
+            RELAY_Q.delete(
+                String(host || "").toLowerCase() + "|" + (port || 443),
+            );
+            return false;
+        }
+        return true;
+    } catch (err) {
+        return false;
+    }
+}
+function recordRelaySuccess(host, port, full) {
+    try {
+        const k =
+            String(host || "").toLowerCase() + "|" + (port || 443);
+        const e = RELAY_Q.get(k);
+        if (!e) return;
+        e.fail = 0;
+        if (full) {
+            e.probeFail = 0;
+            e.until = 0;
+            if (!e.fail && !e.probeFail) RELAY_Q.delete(k);
+        }
+    } catch (err) {}
+}
+function recordRelayFailure(host, port) {
+    try {
+        const k =
+            String(host || "").toLowerCase() + "|" + (port || 443);
+        let e = RELAY_Q.get(k);
+        if (!e) {
+            e = { fail: 0, until: 0, probeFail: 0 };
+            RELAY_Q.set(k, e);
+        }
+        e.fail = (e.fail || 0) + 1;
+        if (e.fail >= RELAY_FAIL_STREAK) {
+            const alreadyOut =
+                e.until && e.until > Date.now() ? true : false;
+            e.until = Date.now() + RELAY_QUARANTINE_MS;
+            // Log only the transition into quarantine, not every failure
+            // afterwards (a dead relay under a reconnect storm would
+            // otherwise spam the log on every single connection).
+            if (!alreadyOut) {
+                try {
+                    console.error(
+                        "relay-quarantined: " + k + " (" + e.fail + " fails)",
+                    );
+                } catch (err) {}
+            }
+        }
+        if (RELAY_Q.size > 2000) RELAY_Q.clear();
+    } catch (err) {}
+}
+function filterQuarantinedRelays(list) {
+    try {
+        const live = (list || []).filter((t) => {
+            const rk = relayKeyOf(t);
+            if (!rk) return true;
+            return !isRelayQuarantined(rk.host, rk.port);
+        });
+        return live.length > 0 ? live : list || [];
+    } catch (e) {
+        return list || [];
+    }
+}
+// ==== AI smart egress (same structure as Sepidar panel) ====
+// Gemini/ChatGPT-class endpoints often reject datacenter egress (or
+// blocked-country egress), so AI traffic prefers relays explicitly flagged
+// `#AI` (clean-country relays). List shared with Sepidar for agency-wide
+// consistent behavior. Plain google.com is intentionally NOT listed.
+const AI_LLM_SUFFIXES = [
+    "gemini.google.com",
+    "generativelanguage.googleapis.com",
+    "ai.google.dev",
+    "bard.google.com",
+    "openai.com",
+    "chatgpt.com",
+    "anthropic.com",
+    "claude.ai",
+    "copilot.microsoft.com",
+    "bing.com",
+    "meta.ai",
+    "x.ai",
+    "grok.com",
+    "deepseek.com",
+    "perplexity.ai",
+    "poe.com",
+    "character.ai",
+    "you.com",
+    "mistral.ai",
+    "chat.mistral.ai",
+];
+function isAiDomain(d) {
+    try {
+        const v = String(d || "")
+            .toLowerCase()
+            .replace(/\.$/, "")
+            .trim();
+        if (!v || v.length > 253) return false;
+        for (const sfx of AI_LLM_SUFFIXES) {
+            if (v === sfx || v.endsWith("." + sfx)) return true;
+        }
+        return false;
+    } catch (e) {
+        return false;
+    }
+}
+// TLS SNI sniffing (pure, bounds-checked): extracts the Server Name from a
+// ClientHello so IP-literal destinations can still be classified. Returns
+// the hostname or null. Never throws.
+function sniffSniFromHello(data) {
+    try {
+        const raw =
+            data instanceof Uint8Array ? data : new Uint8Array(data || []);
+        if (!raw || raw.byteLength <= 43) return null;
+        if (raw[0] !== 0x16 || raw[5] !== 0x01) return null;
+        let pos = 43;
+        if (pos + 1 > raw.byteLength) return null;
+        const sessionIdLen = raw[pos];
+        pos += 1 + sessionIdLen;
+        if (pos + 2 > raw.byteLength) return null;
+        const cipherSuitesLen = (raw[pos] << 8) | raw[pos + 1];
+        pos += 2 + cipherSuitesLen;
+        if (pos + 1 > raw.byteLength) return null;
+        const compMethodsLen = raw[pos];
+        pos += 1 + compMethodsLen;
+        if (pos + 2 > raw.byteLength) return null;
+        const extensionsLen = (raw[pos] << 8) | raw[pos + 1];
+        pos += 2;
+        const endPos = Math.min(pos + extensionsLen, raw.byteLength);
+        while (pos + 4 <= endPos) {
+            const extType = (raw[pos] << 8) | raw[pos + 1];
+            const extLen = (raw[pos + 2] << 8) | raw[pos + 3];
+            pos += 4;
+            if (extType === 0x0000) {
+                if (pos + 2 > raw.byteLength) return null;
+                const sniPos = pos + 2;
+                if (raw[sniPos] === 0x00) {
+                    if (sniPos + 3 > raw.byteLength) return null;
+                    const sniLen =
+                        (raw[sniPos + 1] << 8) | raw[sniPos + 2];
+                    if (sniLen <= 0 || sniLen > 253) return null;
+                    if (sniPos + 3 + sniLen > raw.byteLength) return null;
+                    try {
+                        return new TextDecoder().decode(
+                            raw.slice(sniPos + 3, sniPos + 3 + sniLen),
+                        );
+                    } catch (e) {
+                        return null;
+                    }
+                }
+                return null;
+            }
+            pos += extLen;
+        }
+        return null;
+    } catch (e) {
+        return null;
+    }
+}
+// `#AI` flag detector for relay tokens. Nahan `#suffix` is otherwise a
+// display name, so detection is purely additive: names are never rewritten,
+// and a lone `#AI` simply doubles as the flag.
+function relayAiFlag(tok) {
+    try {
+        const s = String(tok || "");
+        const hi = s.indexOf("#");
+        if (hi === -1) return false;
+        const toks = s.slice(hi + 1).split(/[\s,;]+/);
+        for (const t of toks) {
+            if (String(t).toLowerCase() === "ai") return true;
+        }
+        return false;
+    } catch (e) {
+        return false;
+    }
+}
+// Stable-partition AI-flagged relay tokens to the front.
+// Returns {list, moved}: moved=false means order is untouched.
+function orderAiFirstTokens(pips) {
+    try {
+        const list = Array.isArray(pips) ? pips : [];
+        const ai = [];
+        const rest = [];
+        for (const t of list) {
+            if (relayAiFlag(t)) ai.push(t);
+            else rest.push(t);
+        }
+        if (ai.length === 0) return { list, moved: false };
+        return { list: ai.concat(rest), moved: true };
+    } catch (e) {
+        return { list: [], moved: false };
+    }
+}
+function buildProbeHello(sni) {
+    try {
+        const sn = new TextEncoder()
+            .encode(String(sni || "cloudflare-dns.com"))
+            .slice(0, 64);
+        const rnd = new Uint8Array(32);
+        try {
+            crypto.getRandomValues(rnd);
+        } catch (e) {}
+        const body = [0x03, 0x03];
+        for (let i = 0; i < 32; i++) body.push(rnd[i]);
+        body.push(0x00);
+        const cs = [0x13, 0x01, 0x13, 0x02, 0x13, 0x03, 0xc0, 0x2b];
+        body.push((cs.length >> 8) & 0xff, cs.length & 0xff);
+        for (const b of cs) body.push(b);
+        body.push(0x01, 0x00);
+        const ext = [0x00, 0x00];
+        const namePart = [0x00, (sn.length >> 8) & 0xff, sn.length & 0xff];
+        for (let i = 0; i < sn.length; i++) namePart.push(sn[i]);
+        const entry = [
+            (namePart.length >> 8) & 0xff,
+            namePart.length & 0xff,
+        ].concat(namePart);
+        const extBlock = [(entry.length >> 8) & 0xff, entry.length & 0xff].concat(entry);
+        for (const b of extBlock) ext.push(b);
+        body.push((ext.length >> 8) & 0xff, ext.length & 0xff);
+        for (const b of ext) body.push(b);
+        const out = [0x16, 0x03, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00];
+        out[3] = ((body.length + 4) >> 8) & 0xff;
+        out[4] = (body.length + 4) & 0xff;
+        out[6] = (body.length >> 16) & 0xff;
+        out[7] = (body.length >> 8) & 0xff;
+        out[8] = body.length & 0xff;
+        const full = out.concat(body);
+        return new Uint8Array(full);
+    } catch (e) {
+        return null;
+    }
+}
+async function probeRelayOnce(host, port) {
+    let sock = null;
+    try {
+        const probePort = port || 443;
+        sock = connect({ hostname: host, port: probePort });
+        await withTimeout(sock.opened, 4000, "probe-timeout");
+        // Non-TLS ports (e.g. :80 relays): a completed TCP open already
+        // proves liveness. Sending a TLS hello there would always fail and
+        // bury healthy relays, so stop here.
+        if (!RELAY_TLS_PORTS.has(String(probePort))) return true;
+        const hello = buildProbeHello("cloudflare-dns.com");
+        if (!hello) return false;
+        const writer = sock.writable.getWriter();
+        try {
+            await withTimeout(writer.write(hello), 4000, "probe-timeout");
+        } finally {
+            try {
+                writer.releaseLock();
+            } catch (e) {}
+        }
+        const reader = sock.readable.getReader();
+        try {
+            const res = await withTimeout(
+                reader.read(),
+                4000,
+                "probe-timeout",
+            );
+            if (!res || res.done || !res.value) return false;
+            const b = new Uint8Array(res.value);
+            return b.length >= 2 && b[0] === 0x16 && b[1] === 0x03;
+        } finally {
+            try {
+                reader.releaseLock();
+            } catch (e) {}
+        }
+    } catch (e) {
+        return false;
+    } finally {
+        try {
+            if (sock) sock.close();
+        } catch (e) {}
+    }
+}
+function collectRelayInventory() {
+    const out = new Map();
+    const addRaw = (raw) => {
+        try {
+            String(raw || "")
+                .split(/[\r\n,;]+/)
+                .forEach((t) => {
+                    const rk = relayKeyOf(t);
+                    if (rk && !out.has(rk.key))
+                        out.set(rk.key, { host: rk.host, port: rk.port });
+                });
+        } catch (e) {}
+    };
+    try {
+        addRaw(sysConfig.backupRelay);
+        addRaw(sysConfig.customRelay);
+        (sysConfig.users || []).forEach((u) => {
+            try {
+                addRaw(u.proxyIp);
+            } catch (e) {}
+        });
+    } catch (e) {}
+    return Array.from(out.values());
+}
+function pruneAutomationOff() {
+    try {
+        const v = sysConfig.autoPruneRelays;
+        if (v === undefined || v === null) return false;
+        const s = String(v).trim().toLowerCase();
+        return s === "0" || s === "off" || s === "no" || s === "false";
+    } catch (e) {
+        return false;
+    }
+}
+async function loadRelayHealthSnapshot(env) {
+    try {
+        if (RELAY_Q.size > 0) return;
+        const raw = await d1Get(env, "relay_health");
+        if (!raw) return;
+        const snap = JSON.parse(raw);
+        const now = Date.now();
+        const q = snap.q || {};
+        for (const k of Object.keys(q)) {
+            if (q[k] && q[k] > now && RELAY_Q.size < 2000)
+                RELAY_Q.set(k, { fail: 0, until: q[k], probeFail: 0 });
+        }
+    } catch (e) {}
+}
+async function saveRelayHealthSnapshot(env) {
+    try {
+        if (Date.now() - lastHealthSave < PROBE_INTERVAL_MS) return;
+        lastHealthSave = Date.now();
+        const q = {};
+        let active = 0;
+        for (const [k, v] of RELAY_Q.entries()) {
+            if (v && v.until && v.until > Date.now()) {
+                q[k] = v.until;
+                active++;
+            }
+        }
+        if (active > 0) {
+            await d1Put(
+                env,
+                "relay_health",
+                JSON.stringify({ q }).slice(0, 8000),
+            );
+        } else {
+            await d1Put(env, "relay_health", "{}");
+        }
+    } catch (e) {}
+}
+async function probeDeadRelays(env) {
+    try {
+        if (pruneAutomationOff()) return;
+        const now = Date.now();
+        if (now - lastProbeTs < PROBE_INTERVAL_MS) return;
+        lastProbeTs = now;
+        await loadRelayHealthSnapshot(env);
+        const inv = collectRelayInventory();
+        if (inv.length === 0) return;
+        const scored = inv
+            .map((r) => {
+                const e = RELAY_Q.get(r.host + "|" + r.port);
+                return { r, pf: (e && e.probeFail) || 0 };
+            })
+            .sort(
+                (a, b) =>
+                    b.pf - a.pf ||
+                    (a.r.host < b.r.host ? -1 : 1),
+            )
+            .slice(0, PROBE_MAX_PER_ROUND);
+        // Probes run in parallel (bounded to PROBE_MAX_PER_ROUND relays) so
+        // a full round fits the background-task budget; mutations below
+        // stay strictly sequential to avoid concurrent sys_config writes.
+        const results = await Promise.all(
+            scored.map(async ({ r }) => {
+                let ok = false;
+                try {
+                    ok = await probeRelayOnce(r.host, r.port);
+                } catch (e) {
+                    ok = false;
+                }
+                return { r, ok };
+            }),
+        );
+        for (const { r } of results.filter((x) => x.ok)) {
+            recordRelaySuccess(r.host, r.port, true);
+        }
+        for (const { r } of results.filter((x) => !x.ok)) {
+            const k = r.host + "|" + r.port;
+            let e = RELAY_Q.get(k);
+            if (!e) {
+                e = { fail: 0, until: 0, probeFail: 0 };
+                RELAY_Q.set(k, e);
+            }
+            e.probeFail = (e.probeFail || 0) + 1;
+            e.until = Date.now() + 600000;
+            if (e.probeFail >= PROBE_FAIL_LIMIT) {
+                try {
+                    await buryDeadRelay(env, r.host, r.port);
+                } catch (err) {}
+            }
+        }
+        await saveRelayHealthSnapshot(env);
+    } catch (e) {}
+}
+async function buryDeadRelay(env, host, port) {
+    try {
+        if (!env || !env.IOT_DB || !host) return false;
+        if (pruneAutomationOff()) return false;
+        const hostLower = String(host).toLowerCase();
+        const portN = port || 443;
+        const deadKey = hostLower + "|" + portN;
+        const keyMatches = (tok) => {
+            try {
+                const rk = relayKeyOf(tok);
+                return !!rk && rk.key === deadKey;
+            } catch (e) {
+                return false;
+            }
+        };
+        const stripDead = (raw) => {
+            const parts = String(raw || "")
+                .split(/[\r\n,;]+/)
+                .map((s) => s.trim())
+                .filter(Boolean);
+            const kept = parts.filter((t) => !keyMatches(t));
+            return { kept, removed: parts.length - kept.length };
+        };
+        // AI flag of the buried relay (if any placement had `#AI`), so the
+        // grave remembers it and resurrect restores it.
+        const tokenHasAi = (raw) => {
+            try {
+                const parts = String(raw || "")
+                    .split(/[\r\n,;]+/)
+                    .map((s) => s.trim())
+                    .filter(Boolean);
+                for (const t of parts) {
+                    if (keyMatches(t) && relayAiFlag(t)) return true;
+                }
+                return false;
+            } catch (e) {
+                return false;
+            }
+        };
+        const lists = [];
+        let aiKeep = false;
+        try {
+            for (const field of ["backupRelay", "customRelay"]) {
+                const raw = sysConfig[field] || "";
+                if (!raw || raw.toLowerCase().indexOf(hostLower) === -1)
+                    continue;
+                const { kept, removed } = stripDead(raw);
+                if (removed > 0) {
+                    if (tokenHasAi(raw)) aiKeep = true;
+                    lists.push("global:" + field);
+                    sysConfig[field] = kept.join(",");
+                    await d1Put(
+                        env,
+                        "sys_config",
+                        JSON.stringify(sysConfig),
+                    );
+                }
+            }
+        } catch (e) {}
+        try {
+            const users = sysConfig.users || [];
+            let touched = false;
+            for (const u of users) {
+                try {
+                    const raw = u.proxyIp || "";
+                    if (
+                        !raw ||
+                        raw.toLowerCase().indexOf(hostLower) === -1
+                    )
+                        continue;
+                    const { kept, removed } = stripDead(raw);
+                    if (removed === 0) continue;
+                    if (kept.length === 0) continue;
+                    if (tokenHasAi(raw)) aiKeep = true;
+                    u.proxyIp = kept.join(",");
+                    lists.push("user:" + (u.name || u.id));
+                    touched = true;
+                } catch (e) {}
+            }
+            if (touched)
+                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+        } catch (e) {}
+        if (lists.length === 0) return true;
+        try {
+            let g = {};
+            try {
+                g = JSON.parse((await d1Get(env, "relay_graveyard")) || "{}");
+            } catch (e) {
+                g = {};
+            }
+            const prev = g[deadKey] || {};
+            let flaps = [];
+            try {
+                const fm = JSON.parse(
+                    (await d1Get(env, "relay_flaps")) || "{}",
+                );
+                flaps = Array.isArray(fm[deadKey])
+                    ? fm[deadKey].filter((t) => nowTs() - t < FLAP_WINDOW_MS)
+                    : [];
+            } catch (e) {
+                flaps = [];
+            }
+            const entry = {
+                host: hostLower,
+                port: portN,
+                ai: !!(prev.ai || aiKeep),
+                buriedAt: Date.now(),
+                lists: Array.from(
+                    new Set([].concat(prev.lists || [], lists)),
+                ).slice(0, 100),
+                burials: (prev.burials || 0) + 1,
+                healthyStreak: 0,
+                unstable: flaps.length >= FLAP_LIMIT,
+            };
+            g[deadKey] = entry;
+            const gk = Object.keys(g);
+            if (gk.length > 50) {
+                gk.sort(
+                    (a, b) =>
+                        ((g[a] && g[a].buriedAt) || 0) -
+                        ((g[b] && g[b].buriedAt) || 0),
+                );
+                for (const drop of gk.slice(0, gk.length - 50)) {
+                    try {
+                        delete g[drop];
+                    } catch (e) {}
+                }
+            }
+            await d1Put(env, "relay_graveyard", JSON.stringify(g));
+            try {
+                console.error(
+                    "relay-buried: " + deadKey + " from " + lists.join(","),
+                );
+            } catch (e) {}
+        } catch (e) {}
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+function nowTs() {
+    return Date.now();
+}
+async function resurrectRelay(env, key, entry) {
+    try {
+        const host = String(entry.host || "").toLowerCase();
+        if (!host) return true;
+        const port = entry.port || 443;
+        // Restore the #AI flag when the buried relay had one (names are
+        // re-added bare, as before — only the flag round-trips).
+        let token = host + (port && port !== 443 ? ":" + port : "");
+        try {
+            if (entry.ai === true) token += "#AI";
+        } catch (e) {}
+        const addToken = (raw) => {
+            const parts = String(raw || "")
+                .split(/[\r\n,;]+/)
+                .map((s) => s.trim())
+                .filter(Boolean);
+            for (const t of parts) {
+                try {
+                    const rk = relayKeyOf(t);
+                    if (rk && rk.key === key) return String(raw || "");
+                } catch (e) {}
+            }
+            return (raw && String(raw).trim()
+                ? String(raw).replace(/,+$/, "") + ","
+                : "") + token;
+        };
+        for (const l of entry.lists || []) {
+            try {
+                if (l === "global:backupRelay") {
+                    sysConfig.backupRelay = addToken(
+                        sysConfig.backupRelay,
+                    );
+                } else if (l === "global:customRelay") {
+                    sysConfig.customRelay = addToken(
+                        sysConfig.customRelay,
+                    );
+                } else if (l.startsWith("user:")) {
+                    const nm = l.slice(5);
+                    const u = (sysConfig.users || []).find(
+                        (x) => x && (x.name === nm || x.id === nm),
+                    );
+                    if (u) u.proxyIp = addToken(u.proxyIp);
+                }
+            } catch (e) {}
+        }
+        await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+        try {
+            console.error("relay-resurrected: " + key);
+        } catch (e) {}
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+async function probeGraveyard(env) {
+    try {
+        if (pruneAutomationOff()) return;
+        const now = Date.now();
+        if (now - lastGraveTs < GRAVE_INTERVAL_MS) return;
+        lastGraveTs = now;
+        let g = {};
+        try {
+            g = JSON.parse((await d1Get(env, "relay_graveyard")) || "{}");
+        } catch (e) {
+            return;
+        }
+        const keys = Object.keys(g).slice(0, 200);
+        keys.sort(
+            (a, b) => ((g[a] && g[a].buriedAt) || 0) - ((g[b] && g[b].buriedAt) || 0),
+        );
+        // Probes in parallel (bounded); grave/config mutations below stay
+        // sequential to avoid concurrent sys_config writes.
+        const graveTargets = keys.slice(0, GRAVE_MAX_PER_ROUND);
+        const graveResults = await Promise.all(
+            graveTargets.map(async (k) => {
+                const entry = g[k];
+                if (!entry || !entry.host) return { k, ok: null };
+                let ok = false;
+                try {
+                    ok = await probeRelayOnce(entry.host, entry.port || 443);
+                } catch (e) {
+                    ok = false;
+                }
+                return { k, ok };
+            }),
+        );
+        let dirty = false;
+        for (const { k, ok } of graveResults) {
+            const entry = g[k];
+            if (!entry || !entry.host) {
+                delete g[k];
+                dirty = true;
+                continue;
+            }
+            if (ok === null) continue;
+            if (ok) {
+                entry.healthyStreak = (entry.healthyStreak || 0) + 1;
+                if (entry.healthyStreak >= GRAVE_HEALTHY_NEED) {
+                    try {
+                        await resurrectRelay(env, k, entry);
+                    } catch (e) {}
+                    try {
+                        const fm = JSON.parse(
+                            (await d1Get(env, "relay_flaps")) || "{}",
+                        );
+                        const arr = Array.isArray(fm[k]) ? fm[k] : [];
+                        arr.push(Date.now());
+                        fm[k] = arr
+                            .filter((t) => Date.now() - t < FLAP_WINDOW_MS)
+                            .slice(-10);
+                        await d1Put(env, "relay_flaps", JSON.stringify(fm));
+                    } catch (e) {}
+                    recordRelaySuccess(entry.host, entry.port || 443, true);
+                    delete g[k];
+                    dirty = true;
+                } else {
+                    dirty = true;
+                }
+            } else {
+                entry.healthyStreak = 0;
+                dirty = true;
+            }
+        }
+        if (dirty) await d1Put(env, "relay_graveyard", JSON.stringify(g));
+    } catch (e) {}
+}
+// Reconnect-storm backoff (per-IP, in-memory): generous caps compatible
+// with mobile CGNAT. Over the cap -> tarpit (slow down); massive flood ->
+// 429. Prevents handshake pile-ups behind a flapping relay.
+const WS_RATE = new Map();
+function wsRateCheck(ip) {
+    try {
+        const now = Date.now();
+        let r = WS_RATE.get(ip);
+        if (!r || now - r.ts > 60000) {
+            r = { n: 0, ts: now };
+            WS_RATE.set(ip, r);
+        }
+        r.n++;
+        if (WS_RATE.size > 10000) WS_RATE.clear();
+        if (r.n > 400) return "refuse";
+        if (r.n > 120) return "tarpit";
+        return "ok";
+    } catch (e) {
+        return "ok";
+    }
+}
+// Admin brute-force shield (in-memory, per IP): 15 bad keys in 15 min ->
+// temporary 429. Counts only failures, so normal admin/API-key traffic
+// (and linked-panel syncs with valid keys) is never affected.
+const LOGIN_ATTEMPTS = new Map();
+const LOGIN_FAIL_LIMIT = 15;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+function authBlocked(ip) {
+    try {
+        const r = LOGIN_ATTEMPTS.get(ip);
+        if (!r) return false;
+        if (Date.now() - r.first > LOGIN_WINDOW_MS) {
+            LOGIN_ATTEMPTS.delete(ip);
+            return false;
+        }
+        return r.n >= LOGIN_FAIL_LIMIT;
+    } catch (e) {
+        return false;
+    }
+}
+function authFail(ip) {
+    try {
+        const now = Date.now();
+        let r = LOGIN_ATTEMPTS.get(ip);
+        if (!r || now - r.first > LOGIN_WINDOW_MS) r = { n: 0, first: now };
+        r.n++;
+        LOGIN_ATTEMPTS.set(ip, r);
+        if (LOGIN_ATTEMPTS.size > 10000) LOGIN_ATTEMPTS.clear();
+    } catch (e) {}
+}
+function authClear(ip) {
+    try {
+        LOGIN_ATTEMPTS.delete(ip);
+    } catch (e) {}
+}
 async function processTelemetryStream(env, ctx, wsRelayIdx) {
     const [client, webSocket] = Object.values(new WebSocketPair());
     webSocket.accept();
@@ -6063,12 +7203,27 @@ async function processTelemetryStream(env, ctx, wsRelayIdx) {
 
 async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
     activeConnections++;
+    try {
+        OPEN_WS++;
+    } catch (e) {}
+    // Per-connection byte counters (up+down). Flushed to usage on close.
+    let connBytesUp = 0;
+    let connBytesDown = 0;
     webSocket.addEventListener("close", () => {
         activeConnections--;
+        try {
+            OPEN_WS = Math.max(0, OPEN_WS - 1);
+        } catch (e) {}
         if (activeClientHash) {
             let cur = activeConns.get(activeClientHash) || 0;
             if (cur > 0) activeConns.set(activeClientHash, cur - 1);
         }
+        try {
+            const totalConnBytes = connBytesUp + connBytesDown;
+            if (activeClientHash && totalConnBytes > 0) {
+                trackUsage(activeClientHash, totalConnBytes, env, ctx);
+            }
+        } catch (e) {}
     });
     webSocket.addEventListener("error", () => {});
     let remoteSocket,
@@ -6088,6 +7243,9 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
                     if (isModeAlpha) webSocket.send(new Uint8Array([0, 0]));
                 } else if (dataWriter) {
                     await dataWriter.write(event.data);
+                    try {
+                        connBytesUp += event.data?.byteLength || 0;
+                    } catch (e) {}
                 }
             } catch (err) {
                 webSocket.close();
@@ -6302,12 +7460,23 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
             /^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$/.test(targetAddr) ||
             /^[a-zA-Z0-9-]+$/.test(targetAddr);
         let connectAddr = targetAddr;
+        // AI smart egress classification: explicit domain literal, else TLS
+        // SNI sniff (clients usually send an IP literal in the header).
+        let aiEgress = false;
+        try {
+            if (isDomain) aiEgress = isAiDomain(targetAddr);
+            else if (targetPort === 443 && offset < bufferData.byteLength) {
+                aiEgress = isAiDomain(
+                    sniffSniFromHello(bufferData.slice(offset)),
+                );
+            }
+        } catch (e) {}
         if (isDomain && sysConfig.customDns) {
             try {
                 const dohUrl = new URL(sysConfig.customDns);
                 dohUrl.searchParams.set("name", targetAddr);
                 dohUrl.searchParams.set("type", "A");
-                let dnsRes = await fetch(dohUrl.toString(), {
+                let dnsRes = await fetchT(dohUrl.toString(), {
                     headers: { accept: "application/dns-json" },
                 });
                 let dnsJson = await dnsRes.json();
@@ -6319,7 +7488,7 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
 
         try {
             remoteSocket = connect({ hostname: connectAddr, port: targetPort });
-            await remoteSocket.opened;
+            await withTimeout(remoteSocket.opened, 5000, "connect-timeout");
         } catch {
             let pips = [];
             if (activeProfile && activeProfile.proxyIp) {
@@ -6342,8 +7511,21 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
             }
 
             // Consistent hash based on user/profile ID to prevent session/IP splitting across assets on Cloudflare
+            // AI smart egress: AI-flagged relays first, deterministic (no
+            // rotation) so AI exits via clean-country relays. Untouched when
+            // no AI relay is present (distribution exactly as before).
             let startIndex = 0;
-            if (pips.length > 1) {
+            let aiPinned = false;
+            try {
+                if (aiEgress) {
+                    const ord = orderAiFirstTokens(pips);
+                    if (ord.moved) {
+                        pips = ord.list;
+                        aiPinned = true;
+                    }
+                }
+            } catch (e) {}
+            if (pips.length > 1 && !aiPinned) {
                 let hash = 0;
                 let hashStr = activeProfile ? activeProfile.id : "";
                 for (let i = 0; i < hashStr.length; i++) {
@@ -6353,24 +7535,35 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
             }
 
             // Attempt to connect with automatic failover to alternative proxy IPs
+            // (quarantined relays are skipped unless everything is down).
             let connected = false;
+            const tryPips = filterQuarantinedRelays(pips);
             for (
                 let attempt = 0;
-                attempt < Math.min(pips.length, 3);
+                attempt < Math.min(tryPips.length, 3);
                 attempt++
             ) {
-                let currentIndex = (startIndex + attempt) % pips.length;
-                let currentProxy = pips[currentIndex];
+                let currentIndex = (startIndex + attempt) % tryPips.length;
+                let currentProxy = tryPips[currentIndex];
+                const rkFail = relayKeyOf(currentProxy);
                 try {
                     const [altIP, altPortStr] = currentProxy.split(":");
                     remoteSocket = connect({
                         hostname: altIP,
                         port: altPortStr ? Number(altPortStr) : targetPort,
                     });
-                    await remoteSocket.opened;
+                    await withTimeout(
+                        remoteSocket.opened,
+                        5000,
+                        "connect-timeout",
+                    );
                     connected = true;
+                    if (rkFail)
+                        recordRelaySuccess(rkFail.host, rkFail.port, false);
                     break;
                 } catch (e) {
+                    if (rkFail)
+                        recordRelayFailure(rkFail.host, rkFail.port);
                     // Try next fallback proxy IP in list
                 }
             }
@@ -6384,10 +7577,16 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
         if (offset < bufferData.byteLength) {
             let chunk = bufferData.slice(offset);
             await dataWriter.write(chunk);
+            try {
+                connBytesUp += chunk.byteLength || 0;
+            } catch (e) {}
         }
         remoteSocket.readable.pipeTo(
             new WritableStream({
                 write(chunk) {
+                    try {
+                        connBytesDown += chunk?.byteLength || 0;
+                    } catch (e) {}
                     webSocket.send(chunk);
                 },
             }),
@@ -6440,11 +7639,11 @@ function getSubscriptionStats(targetSub = null) {
 
     let idClean = id.replace(/-/g, "").toLowerCase();
     let sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0 };
-    let totalReqs = sysU.reqs || 0;
+    let totalBytesUsed = usageTotalBytes(sysU);
 
-    let totalGb = (totalReqs / 6000).toFixed(2);
+    let totalGb = (totalBytesUsed / 1073741824).toFixed(2);
     let limitTotalGb = limitTotalReq
-        ? (limitTotalReq / 6000).toFixed(2)
+        ? (limitReqToBytes(limitTotalReq) / 1073741824).toFixed(2)
         : "Unlimited";
 
     let expiryDateTxt = "Never Expire";
@@ -6738,7 +7937,7 @@ async function preloadIpFlags(profiles, hostNames) {
             };
         });
         try {
-            const res = await fetch(
+            const res = await fetchT(
                 "http://ip-api.com/batch?fields=status,country,countryCode,city,isp,org",
                 {
                     method: "POST",
@@ -6832,7 +8031,7 @@ async function fetchIpGeoData(ip) {
         .split("#")[0]
         .trim();
     try {
-        const res = await fetch(
+        const res = await fetchT(
             `http://ip-api.com/json/${clean}?fields=status,country,countryCode,city,isp,org`,
         );
         const data = await res.json();
@@ -7389,19 +8588,19 @@ async function fetchTemplates(env) {
     const repo = sysConfig.githubRepo || "itsyebekhe/nahan";
     if (!clashTemplate) {
         try {
-            let res = await fetch(`https://raw.githubusercontent.com/${repo}/main/clash.yml`);
+            let res = await fetchT(`https://raw.githubusercontent.com/${repo}/main/clash.yml`);
             if (res.ok) clashTemplate = await res.text();
         } catch(e) {}
     }
     if (!singboxTemplate) {
         try {
-            let res = await fetch(`https://raw.githubusercontent.com/${repo}/main/singbox.json`);
+            let res = await fetchT(`https://raw.githubusercontent.com/${repo}/main/singbox.json`);
             if (res.ok) singboxTemplate = await res.json();
         } catch(e) {}
     }
     if (!VTemplate) {
         try {
-            let res = await fetch(`https://raw.githubusercontent.com/${repo}/main/v.json`);
+            let res = await fetchT(`https://raw.githubusercontent.com/${repo}/main/v.json`);
             if (res.ok) VTemplate = await res.json();
         } catch(e) {}
     }
