@@ -1705,6 +1705,13 @@ async function handleUsersApi(request, env, ctx) {
                 nat64,
                 connLimit,
                 userPanelUrl,
+                segMode,
+                segPackets,
+                segLengths,
+                segDelays,
+                segMaxSplit,
+                segManual,
+                tlsMask,
             } = body;
             if (!name)
                 return new Response(
@@ -1740,6 +1747,16 @@ async function handleUsersApi(request, env, ctx) {
                 nat64: nat64 || null,
                 connLimit: connLimit ? parseInt(connLimit) : null,
                 userPanelUrl: userPanelUrl || null,
+                segMode:
+                    segMode === "builder" || segMode === "manual"
+                        ? segMode
+                        : null,
+                segPackets: segPackets ? String(segPackets).slice(0, 32) : null,
+                segLengths: segLengths ? String(segLengths).slice(0, 200) : null,
+                segDelays: segDelays ? String(segDelays).slice(0, 200) : null,
+                segMaxSplit: segMaxSplit ? String(segMaxSplit).slice(0, 12) : null,
+                segManual: segManual ? String(segManual).slice(0, 4000) : null,
+                tlsMask: tlsMask ? String(tlsMask).slice(0, 2000) : null,
                 createdAt: Date.now(),
             };
             await resolveUserProxyIpGeo(newUser);
@@ -1787,6 +1804,9 @@ async function handleUsersApi(request, env, ctx) {
                         headers: { "Content-Type": "application/json" },
                     },
                 );
+            // Graveyard placements are keyed "user:<name>": migrate them on
+            // rename or buried relays of this user would never resurrect.
+            const oldUName = u.name;
             if (body.name !== undefined) u.name = body.name;
             if (body.trafficLimit !== undefined)
                 u.limitTotalReq = body.trafficLimit
@@ -1822,6 +1842,35 @@ async function handleUsersApi(request, env, ctx) {
                 u.connLimit = body.connLimit ? parseInt(body.connLimit) : null;
             if (body.userPanelUrl !== undefined)
                 u.userPanelUrl = body.userPanelUrl || null;
+            if (body.segMode !== undefined)
+                u.segMode =
+                    body.segMode === "builder" || body.segMode === "manual"
+                        ? body.segMode
+                        : null;
+            if (body.segPackets !== undefined)
+                u.segPackets = body.segPackets
+                    ? String(body.segPackets).slice(0, 32)
+                    : null;
+            if (body.segLengths !== undefined)
+                u.segLengths = body.segLengths
+                    ? String(body.segLengths).slice(0, 200)
+                    : null;
+            if (body.segDelays !== undefined)
+                u.segDelays = body.segDelays
+                    ? String(body.segDelays).slice(0, 200)
+                    : null;
+            if (body.segMaxSplit !== undefined)
+                u.segMaxSplit = body.segMaxSplit
+                    ? String(body.segMaxSplit).slice(0, 12)
+                    : null;
+            if (body.segManual !== undefined)
+                u.segManual = body.segManual
+                    ? String(body.segManual).slice(0, 4000)
+                    : null;
+            if (body.tlsMask !== undefined)
+                u.tlsMask = body.tlsMask
+                    ? String(body.tlsMask).slice(0, 2000)
+                    : null;
             if (body.status !== undefined) {
                 if (body.status === "active") {
                     u.isPaused = false;
@@ -1833,6 +1882,43 @@ async function handleUsersApi(request, env, ctx) {
                     u.disabledAt = null;
                 }
             }
+            try {
+                if (
+                    oldUName &&
+                    u.name &&
+                    oldUName !== u.name
+                ) {
+                    const gg = JSON.parse(
+                        (await d1Get(env, "relay_graveyard")) || "{}",
+                    );
+                    let gChanged = false;
+                    for (const gk of Object.keys(gg || {})) {
+                        const ge = gg[gk];
+                        if (
+                            ge &&
+                            Array.isArray(ge.lists) &&
+                            ge.lists.indexOf("user:" + oldUName) !== -1
+                        ) {
+                            ge.lists = [
+                                ...new Set(
+                                    ge.lists.map((l) =>
+                                        l === "user:" + oldUName
+                                            ? "user:" + u.name
+                                            : l,
+                                    ),
+                                ),
+                            ];
+                            gChanged = true;
+                        }
+                    }
+                    if (gChanged)
+                        await d1Put(
+                            env,
+                            "relay_graveyard",
+                            JSON.stringify(gg),
+                        );
+                }
+            } catch (e) {}
             await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
             ctx?.waitUntil(
                 logActivity(
@@ -1955,8 +2041,45 @@ async function handleUsersApi(request, env, ctx) {
     }
 }
 
-async function handleStatsApi(request, env) {
+// Relay health snapshot for /api/stats (agency monitoring parity with
+// Sepidar /api/health): quarantine + graveyard + AI quarantine. Read-only,
+// memory + 2 cached D1 reads at most; never throws.
+function relayHealthSnapshot() {
+    const out = { quarantined: [], graveyard: [], aiQuarantine: [] };
     try {
+        const now = Date.now();
+        for (const [k, e] of RELAY_Q) {
+            if (e && e.until && e.until > now) out.quarantined.push(k);
+        }
+    } catch (e) {}
+    try {
+        for (const [k, e] of AI_RELAY_Q) {
+            if (e && e.until && Date.now() < e.until)
+                out.aiQuarantine.push(k);
+        }
+    } catch (e) {}
+    return out;
+}
+async function relayHealthSnapshotAsync(env) {
+    const out = relayHealthSnapshot();
+    try {
+        if (env && env.IOT_DB) {
+            const g = JSON.parse(
+                (await d1Get(env, "relay_graveyard")) || "{}",
+            );
+            for (const [k, e] of Object.entries(g || {})) {
+                out.graveyard.push({
+                    key: k,
+                    streak: (e && e.healthyStreak) || 0,
+                    unstable: !!(e && e.unstable),
+                    lists: (e && e.lists && e.lists.length) || 0,
+                });
+            }
+        }
+    } catch (e) {}
+    return out;
+}
+async function handleStatsApi(request, env) {    try {
         const url = new URL(request.url);
         const authHeader = request.headers.get("Authorization") || "";
         const authKey =
@@ -2053,6 +2176,7 @@ async function handleStatsApi(request, env) {
                                 sysConfig.masterKey === "admin",
                         },
                     },
+                    relays: await relayHealthSnapshotAsync(env),
                 },
             }),
             { headers: { "Content-Type": "application/json" } },
@@ -6381,9 +6505,11 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
 // global backupRelay/customRelay. A dead relay hangs WS handshakes and can
 // pile up isolates -> Cloudflare loadShed -> 1101 for everyone.
 // Layers: passive fail-streak quarantine (5 fails -> 15min skip) + active
-// TLS-probe rounds (10min, 6 relays) + graveyard burial with slow re-probe
-// (30min) and auto-resurrect after 3 healthy probes. Kill switch:
-// sysConfig.autoPruneRelays === false/0 freezes burial+probing.
+// TLS-probe rounds (10min, 6 relays, two-stage verdict 4s->7s, floating cap
+// under breaker pressure, round-robin rotation) + graveyard burial with slow
+// re-probe (30min, rotation) and auto-resurrect after 3 healthy probes +
+// per-SNI AI quarantine (AI-only failures never kill general traffic).
+// Kill switch: sysConfig.autoPruneRelays === false/0 freezes burial+probing.
 const RELAY_Q = new Map(); // key "host|port" -> { fail, until, probeFail }
 const RELAY_QUARANTINE_MS = 15 * 60 * 1000;
 const RELAY_FAIL_STREAK = 5;
@@ -6409,6 +6535,9 @@ let lastRelaySweep = 0;
 let lastProbeTs = 0;
 let lastGraveTs = 0;
 let lastHealthSave = 0;
+// Round-robin cursors (module-level so they persist across rounds).
+let probeCursor = 0;
+let graveCursor = 0;
 function relayKeyOf(tok) {
     try {
         let s = String(tok || "").trim();
@@ -6519,6 +6648,83 @@ function recordRelayFailure(host, port) {
         }
         if (RELAY_Q.size > 2000) RELAY_Q.clear();
     } catch (err) {}
+}
+// ==== Per-SNI AI quarantine (same as Sepidar agency-wide): a relay that
+// fails only for a specific SNI (e.g. Google) must not die for all traffic.
+// Memory-only (zero D1 writes): 3 AI-traffic fails in a row = 30min quarantine
+// for AI traffic only. Expiry = automatic re-test; AI success clears it.
+// The chain never ends up empty (fallback keeps the original list).
+const AI_RELAY_Q = new Map();
+const AI_FAIL_STREAK = 3;
+const AI_QUARANTINE_MS = 30 * 60 * 1000;
+function isAiQuarantined(host, port) {
+    try {
+        const k =
+            String(host || "").toLowerCase() + "|" + (port || 443);
+        const e = AI_RELAY_Q.get(k);
+        if (!e) return false;
+        if (e.until) {
+            if (Date.now() < e.until) return true;
+            try {
+                AI_RELAY_Q.delete(k);
+            } catch (err) {}
+            return false;
+        }
+        // Still counting fails (until=0): never delete here or the streak
+        // could never reach the limit (checked on every AI connection).
+        return false;
+    } catch (err) {
+        return false;
+    }
+}
+function recordAiFailure(host, port) {
+    try {
+        if (AI_RELAY_Q.size > 500) {
+            const now0 = Date.now();
+            for (const [kk, vv] of AI_RELAY_Q) {
+                if (!vv || !vv.until || vv.until <= now0) {
+                    try {
+                        AI_RELAY_Q.delete(kk);
+                    } catch (e) {}
+                }
+                if (AI_RELAY_Q.size <= 400) break;
+            }
+        }
+        const k =
+            String(host || "").toLowerCase() + "|" + (port || 443);
+        const now = Date.now();
+        const e = AI_RELAY_Q.get(k) || { fail: 0, until: 0 };
+        if (e.until && now < e.until) return;
+        e.fail++;
+        if (e.fail >= AI_FAIL_STREAK) {
+            e.until = now + AI_QUARANTINE_MS;
+            e.fail = 0;
+            try {
+                console.error("relay-ai-quarantined: " + k);
+            } catch (err) {}
+        }
+        AI_RELAY_Q.set(k, e);
+    } catch (err) {}
+}
+function recordAiSuccess(host, port) {
+    try {
+        AI_RELAY_Q.delete(
+            String(host || "").toLowerCase() + "|" + (port || 443),
+        );
+    } catch (err) {}
+}
+// Token-string variant: Nahan chains carry "IP[:port][#Name]" strings.
+function filterAiQuarantinedTokens(list) {
+    try {
+        const out = (list || []).filter((t) => {
+            const rk = relayKeyOf(t);
+            if (!rk) return true;
+            return !isAiQuarantined(rk.host, rk.port);
+        });
+        return out.length > 0 ? out : list || [];
+    } catch (e) {
+        return list || [];
+    }
 }
 function filterQuarantinedRelays(list) {
     try {
@@ -6673,7 +6879,11 @@ function buildProbeHello(sni) {
         const body = [0x03, 0x03];
         for (let i = 0; i < 32; i++) body.push(rnd[i]);
         body.push(0x00);
-        const cs = [0x13, 0x01, 0x13, 0x02, 0x13, 0x03, 0xc0, 0x2b];
+        // Proven cipher set (same as Sepidar agency-wide): ECDHE suites for
+        // ECDSA+RSA certs. The old SNI-only hello false-failed on strict
+        // servers; groups/point-formats/sigalgs below fix that (verified live
+        // with real ServerHello replies from production relays).
+        const cs = [0xc0, 0x2b, 0xc0, 0x2f, 0xcc, 0xa8, 0xc0, 0x13];
         body.push((cs.length >> 8) & 0xff, cs.length & 0xff);
         for (const b of cs) body.push(b);
         body.push(0x01, 0x00);
@@ -6686,6 +6896,13 @@ function buildProbeHello(sni) {
         ].concat(namePart);
         const extBlock = [(entry.length >> 8) & 0xff, entry.length & 0xff].concat(entry);
         for (const b of extBlock) ext.push(b);
+        // supported_groups (x25519, secp256r1), ec_point_formats, signature_algorithms
+        const extraExts = [
+            0x00, 0x0a, 0x00, 0x06, 0x00, 0x04, 0x00, 0x1d, 0x00, 0x17,
+            0x00, 0x0b, 0x00, 0x02, 0x01, 0x00,
+            0x00, 0x0d, 0x00, 0x08, 0x00, 0x06, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01,
+        ];
+        for (const b of extraExts) ext.push(b);
         body.push((ext.length >> 8) & 0xff, ext.length & 0xff);
         for (const b of ext) body.push(b);
         const out = [0x16, 0x03, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00];
@@ -6700,12 +6917,13 @@ function buildProbeHello(sni) {
         return null;
     }
 }
-async function probeRelayOnce(host, port) {
+async function probeRelayOnce(host, port, timeoutMs) {
     let sock = null;
+    const PM = timeoutMs > 0 ? timeoutMs : 4000;
     try {
         const probePort = port || 443;
         sock = connect({ hostname: host, port: probePort });
-        await withTimeout(sock.opened, 4000, "probe-timeout");
+        await withTimeout(sock.opened, PM, "probe-timeout");
         // Non-TLS ports (e.g. :80 relays): a completed TCP open already
         // proves liveness. Sending a TLS hello there would always fail and
         // bury healthy relays, so stop here.
@@ -6714,7 +6932,7 @@ async function probeRelayOnce(host, port) {
         if (!hello) return false;
         const writer = sock.writable.getWriter();
         try {
-            await withTimeout(writer.write(hello), 4000, "probe-timeout");
+            await withTimeout(writer.write(hello), PM, "probe-timeout");
         } finally {
             try {
                 writer.releaseLock();
@@ -6724,7 +6942,7 @@ async function probeRelayOnce(host, port) {
         try {
             const res = await withTimeout(
                 reader.read(),
-                4000,
+                PM,
                 "probe-timeout",
             );
             if (!res || res.done || !res.value) return false;
@@ -6741,6 +6959,19 @@ async function probeRelayOnce(host, port) {
         try {
             if (sock) sock.close();
         } catch (e) {}
+    }
+}
+// Two-stage verdict (same as Sepidar agency-wide): fast stage (4s), then one
+// retry with a longer timeout (7s) so a slow-but-healthy relay is not wrongly
+// counted dead. Only the final verdict feeds fail counts.
+async function probeRelayVerdict(host, port) {
+    try {
+        if (await probeRelayOnce(host, port, 4000)) return true;
+    } catch (e) {}
+    try {
+        return await probeRelayOnce(host, port, 7000);
+    } catch (e) {
+        return false;
     }
 }
 function collectRelayInventory() {
@@ -6823,6 +7054,8 @@ async function probeDeadRelays(env) {
         await loadRelayHealthSnapshot(env);
         const inv = collectRelayInventory();
         if (inv.length === 0) return;
+        // Sick-first priority, then round-robin rotation so relays past the
+        // per-round cap are not starved forever (same guarantee as Sepidar).
         const scored = inv
             .map((r) => {
                 const e = RELAY_Q.get(r.host + "|" + r.port);
@@ -6832,16 +7065,28 @@ async function probeDeadRelays(env) {
                 (a, b) =>
                     b.pf - a.pf ||
                     (a.r.host < b.r.host ? -1 : 1),
-            )
-            .slice(0, PROBE_MAX_PER_ROUND);
-        // Probes run in parallel (bounded to PROBE_MAX_PER_ROUND relays) so
+            );
+        // Floating cap: under traffic pressure (breaker) probe half as many
+        // so isolate CPU stays with real tunnels.
+        let probeCap = PROBE_MAX_PER_ROUND;
+        try {
+            if (breakerLevel() >= 1)
+                probeCap = Math.max(1, Math.floor(probeCap / 2));
+        } catch (e) {}
+        if (typeof probeCursor !== "number") probeCursor = 0;
+        const rotated = [];
+        for (let i = 0; i < scored.length; i++)
+            rotated.push(scored[(probeCursor + i) % scored.length]);
+        probeCursor = (probeCursor + probeCap) % scored.length;
+        const picked = rotated.slice(0, probeCap);
+        // Probes run in parallel (bounded to probeCap relays) so
         // a full round fits the background-task budget; mutations below
         // stay strictly sequential to avoid concurrent sys_config writes.
         const results = await Promise.all(
-            scored.map(async ({ r }) => {
+            picked.map(async ({ r }) => {
                 let ok = false;
                 try {
-                    ok = await probeRelayOnce(r.host, r.port);
+                    ok = await probeRelayVerdict(r.host, r.port);
                 } catch (e) {
                     ok = false;
                 }
@@ -7082,16 +7327,30 @@ async function probeGraveyard(env) {
         keys.sort(
             (a, b) => ((g[a] && g[a].buriedAt) || 0) - ((g[b] && g[b].buriedAt) || 0),
         );
+        if (keys.length === 0) return;
+        // Round-robin over oldest-first order so graves past the per-round
+        // cap are not starved (same guarantee as Sepidar).
+        if (typeof graveCursor !== "number") graveCursor = 0;
+        const grotated = [];
+        for (let i = 0; i < keys.length; i++)
+            grotated.push(keys[(graveCursor + i) % keys.length]);
+        // Floating cap under traffic pressure (breaker), min 1.
+        let graveCap = GRAVE_MAX_PER_ROUND;
+        try {
+            if (breakerLevel() >= 1)
+                graveCap = Math.max(1, Math.floor(graveCap / 2));
+        } catch (e) {}
+        graveCursor = (graveCursor + graveCap) % keys.length;
         // Probes in parallel (bounded); grave/config mutations below stay
         // sequential to avoid concurrent sys_config writes.
-        const graveTargets = keys.slice(0, GRAVE_MAX_PER_ROUND);
+        const graveTargets = grotated.slice(0, graveCap);
         const graveResults = await Promise.all(
             graveTargets.map(async (k) => {
                 const entry = g[k];
                 if (!entry || !entry.host) return { k, ok: null };
                 let ok = false;
                 try {
-                    ok = await probeRelayOnce(entry.host, entry.port || 443);
+                    ok = await probeRelayVerdict(entry.host, entry.port || 443);
                 } catch (e) {
                     ok = false;
                 }
@@ -7131,6 +7390,9 @@ async function probeGraveyard(env) {
                     dirty = true;
                 }
             } else {
+                try {
+                    console.error("relay-grave-failed: " + k);
+                } catch (e) {}
                 entry.healthyStreak = 0;
                 dirty = true;
             }
@@ -7536,8 +7798,14 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
 
             // Attempt to connect with automatic failover to alternative proxy IPs
             // (quarantined relays are skipped unless everything is down).
+            // Per-SNI AI quarantine: relays failing only AI traffic are skipped
+            // for AI destinations (never for the rest).
             let connected = false;
-            const tryPips = filterQuarantinedRelays(pips);
+            let tryPips = filterQuarantinedRelays(pips);
+            try {
+                if (aiEgress && tryPips.length > 1)
+                    tryPips = filterAiQuarantinedTokens(tryPips);
+            } catch (e) {}
             for (
                 let attempt = 0;
                 attempt < Math.min(tryPips.length, 3);
@@ -7547,10 +7815,18 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
                 let currentProxy = tryPips[currentIndex];
                 const rkFail = relayKeyOf(currentProxy);
                 try {
-                    const [altIP, altPortStr] = currentProxy.split(":");
+                    const [altIP0, altPortStr0] = currentProxy.split(":");
+                    // Strip #Name from the port (Number("8443#X") is NaN) and
+                    // prefer the parsed host (fixes IPv6 + "#Name" tokens).
+                    // Semantics otherwise unchanged (garbage still fails).
+                    const altPortClean = altPortStr0
+                        ? altPortStr0.split("#")[0].trim()
+                        : altPortStr0;
+                    const altIP =
+                        rkFail && rkFail.host ? rkFail.host : altIP0;
                     remoteSocket = connect({
                         hostname: altIP,
-                        port: altPortStr ? Number(altPortStr) : targetPort,
+                        port: altPortClean ? Number(altPortClean) : targetPort,
                     });
                     await withTimeout(
                         remoteSocket.opened,
@@ -7558,12 +7834,24 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
                         "connect-timeout",
                     );
                     connected = true;
-                    if (rkFail)
+                    if (rkFail) {
                         recordRelaySuccess(rkFail.host, rkFail.port, false);
+                        try {
+                            if (aiEgress)
+                                recordAiSuccess(rkFail.host, rkFail.port);
+                        } catch (e) {}
+                    }
                     break;
                 } catch (e) {
-                    if (rkFail)
-                        recordRelayFailure(rkFail.host, rkFail.port);
+                    if (rkFail) {
+                        try {
+                            // AI-only failures feed the AI map so the relay
+                            // stays alive for all other traffic.
+                            if (aiEgress)
+                                recordAiFailure(rkFail.host, rkFail.port);
+                            else recordRelayFailure(rkFail.host, rkFail.port);
+                        } catch (ee) {}
+                    }
                     // Try next fallback proxy IP in list
                 }
             }
@@ -8195,6 +8483,138 @@ function getEffectivePips(p) {
     return pips;
 }
 
+// ─── Per-user segmentation (anti-filter fragment) + TLS mask ──────────────
+// Storage (users[] object): segMode "off"|"builder"|"manual",
+// builder fields segPackets/segLengths/segDelays/segMaxSplit,
+// manual field segManual (classic "a-b,c-d,packets" OR finalmask JSON),
+// TLS mask field tlsMask (colon-separated TLS_* cipher list).
+// All helpers are fail-open: invalid input yields null (link built plain).
+function parseSegRangeList(s, maxItems) {
+    try {
+        const items = String(s || "")
+            .split(",")
+            .map((x) => x.trim())
+            .filter(Boolean)
+            .slice(0, maxItems);
+        if (!items.length) return null;
+        for (const it of items) {
+            if (!/^\d{1,5}(-\d{1,5})?$/.test(it)) return null;
+        }
+        return items;
+    } catch (e) {
+        return null;
+    }
+}
+function resolveSegFragment(p) {
+    // { kind: 'classic', value } | { kind: 'fm', value } | null. Fail-open.
+    try {
+        if (!p) return null;
+        const mode = String(p.segMode || "off").toLowerCase();
+        if (mode === "builder") {
+            const packets = String(p.segPackets || "").trim().slice(0, 32);
+            if (!packets) return null;
+            if (
+                packets !== "tlshello" &&
+                !/^\d{1,3}-\d{1,3}$/.test(packets)
+            )
+                return null;
+            const lengths = parseSegRangeList(p.segLengths, 8);
+            const delays = parseSegRangeList(p.segDelays, 8);
+            const maxSplit = String(p.segMaxSplit ?? "").trim();
+            if (!lengths || !delays) return null;
+            if (!/^\d{1,6}$/.test(maxSplit)) return null;
+            return {
+                kind: "fm",
+                value: {
+                    tcp: [
+                        {
+                            type: "fragment",
+                            settings: { packets, lengths, delays, maxSplit },
+                        },
+                    ],
+                },
+            };
+        }
+        if (mode === "manual") {
+            const raw = String(p.segManual || "").trim().slice(0, 4000);
+            if (!raw) return null;
+            if (raw.charAt(0) === "{") {
+                let obj = null;
+                try {
+                    obj = JSON.parse(raw);
+                } catch (e) {
+                    return null;
+                }
+                if (
+                    !obj ||
+                    typeof obj !== "object" ||
+                    !Array.isArray(obj.tcp) ||
+                    obj.tcp.length === 0
+                )
+                    return null;
+                return { kind: "fm", value: { tcp: obj.tcp } };
+            }
+            if (
+                /^\d{1,5}-\d{1,5},\d{1,5}-\d{1,5},(tlshello|\d{1,3}-\d{1,3})$/.test(
+                    raw,
+                )
+            )
+                return { kind: "classic", value: raw };
+            return null;
+        }
+        return null;
+    } catch (e) {
+        return null;
+    }
+}
+function buildSegFragmentParam(p) {
+    // Returns "" or "&fragment=..." / "&fm=..." (already encoded).
+    try {
+        const r = resolveSegFragment(p);
+        if (!r) return "";
+        if (r.kind === "fm")
+            return "&fm=" + encodeURIComponent(JSON.stringify(r.value));
+        return "&fragment=" + encodeURIComponent(String(r.value));
+    } catch (e) {
+        return "";
+    }
+}
+function getSegStreamExtra(p) {
+    // Xray streamSettings object for vjson builder: { finalmask } | { fragment } | {}.
+    try {
+        const r = resolveSegFragment(p);
+        if (!r) return {};
+        if (r.kind === "fm") return { finalmask: r.value };
+        const m = String(r.value).split(",");
+        return {
+            fragment: { packets: m[2], length: m[0], interval: m[1] },
+        };
+    } catch (e) {
+        return {};
+    }
+}
+function buildTlsMaskParam(p) {
+    // Returns "" or "&cs=..." (already encoded).
+    try {
+        if (!p || !p.tlsMask) return "";
+        const v = String(p.tlsMask).trim().slice(0, 2000);
+        if (!/^(TLS_[A-Za-z0-9_]+)(:TLS_[A-Za-z0-9_]+)*$/.test(v)) return "";
+        return "&cs=" + encodeURIComponent(v);
+    } catch (e) {
+        return "";
+    }
+}
+function isSegEnabled(p) {
+    try {
+        if (!p) return false;
+        const mode = String(p.segMode || "off").toLowerCase();
+        if (mode !== "builder" && mode !== "manual") return false;
+        return buildSegFragmentParam(p) !== "";
+    } catch (e) {
+        return false;
+    }
+}
+
 // ─── Upstream VLESS URI Parser ───────────────────────────────────────
 // Parses a VLESS URI like:
 //   vless://uuid@server:port?type=ws&security=tls&sni=example.com&path=/ws#Name
@@ -8440,6 +8860,11 @@ async function buildUriProfile(
                 let extBase = `encryption=none&security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${reqPath}`;
                 if (sysConfig.enableOpt2) extBase += `&pbk=enabled`;
                 extBase += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
+                // Per-user segmentation (fragment/finalmask) + TLS mask.
+                try {
+                    extBase += buildSegFragmentParam(p);
+                    extBase += buildTlsMaskParam(p);
+                } catch (e) {}
                 ips.forEach((ip) => {
                     let _pips = pips.length > 0 ? pips : [null];
                     _pips.forEach((selectedProxyIp) => {
@@ -8495,6 +8920,10 @@ async function buildUriProfile(
                         if (sysConfig.enableOpt2)
                             trojanExtBase += `&pbk=enabled`;
                         trojanExtBase += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
+                        try {
+                            trojanExtBase += buildSegFragmentParam(p);
+                            trojanExtBase += buildTlsMaskParam(p);
+                        } catch (e) {}
                         lines.push(
                             `${getBeta()}://${p.id}@${ip}:${port}?${trojanExtBase}#${tName}`,
                         );
@@ -8560,6 +8989,10 @@ async function buildUriProfile(
                             if (sysConfig.enableOpt2)
                                 trojanExtBase2 += `&pbk=enabled`;
                             trojanExtBase2 += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
+                            try {
+                                trojanExtBase2 += buildSegFragmentParam(p);
+                                trojanExtBase2 += buildTlsMaskParam(p);
+                            } catch (e) {}
                             lines.push(
                                 `${getBeta()}://${p.id}@${ip}:${port}?${trojanExtBase2}#${dtName}`,
                             );
@@ -9706,7 +10139,8 @@ async function buildVJsonProfile(hostName, targetSub = null, allowInsecure = fal
                                     network: "ws",
                                     security: sec,
                                     tlsSettings: sec === "tls" ? { serverName: hName, allowInsecure: allowInsecure } : undefined,
-                                    wsSettings: { path: path, headers: { Host: hName } }
+                                    wsSettings: { path: path, headers: { Host: hName } },
+                                    ...getSegStreamExtra(p)
                                 }
                             };
                             outboundsArr.push(ob);
@@ -9728,7 +10162,8 @@ async function buildVJsonProfile(hostName, targetSub = null, allowInsecure = fal
                                     network: "ws",
                                     security: sec,
                                     tlsSettings: sec === "tls" ? { serverName: hName, allowInsecure: allowInsecure } : undefined,
-                                    wsSettings: { path: path, headers: { Host: hName } }
+                                    wsSettings: { path: path, headers: { Host: hName } },
+                                    ...getSegStreamExtra(p)
                                 }
                             };
                             outboundsArr.push(ob);
@@ -9924,6 +10359,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                                 enabled: sec,
                                 server_name: hName,
                                 insecure: allowInsecure,
+                                ...(isSegEnabled(p) ? { fragment: true } : {}),
                                 alpn: ["http/1.1"],
                                 utls: {
                                     enabled: true,
@@ -9993,6 +10429,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                                 enabled: sec,
                                 server_name: hName,
                                 insecure: allowInsecure,
+                                ...(isSegEnabled(p) ? { fragment: true } : {}),
                                 alpn: ["http/1.1"],
                                 utls: {
                                     enabled: true,
@@ -10062,6 +10499,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                                     enabled: sec,
                                     server_name: hName,
                                     insecure: allowInsecure,
+                                    ...(isSegEnabled(p) ? { fragment: true } : {}),
                                     alpn: ["http/1.1"],
                                     utls: {
                                         enabled: true,
@@ -10126,6 +10564,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                                     enabled: sec,
                                     server_name: hName,
                                     insecure: allowInsecure,
+                                    ...(isSegEnabled(p) ? { fragment: true } : {}),
                                     alpn: ["http/1.1"],
                                     utls: {
                                         enabled: true,
