@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "3.0.2";
+const CURRENT_VERSION = "3.0.3";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -33,21 +33,56 @@ const safeBtoa = (str) => {
 // leaves the request with no events in the loop -> Cloudflare 1101
 // ("never generate a response"). Same signature as fetch + timeoutMs.
 async function fetchT(url, init = {}, timeoutMs = 10000) {
+    // Bounded fetch: hard timeout so a hanging origin (ubuntu/docker,
+    // ip-api, DoH, github, telegram, CF API) can never leave the request
+    // with no events in the loop -> Cloudflare 1101. Caller abort signals
+    // are bridged into the internal controller, never replaced.
+    const timeout = Math.max(1, Number(timeoutMs) || 10000);
+    let controller = null;
+    let timer = null;
+    let callerSignal = null;
+    let onCallerAbort = null;
     try {
-        if (
-            typeof AbortSignal !== "undefined" &&
-            typeof AbortSignal.timeout === "function"
-        ) {
+        if (typeof AbortController !== "undefined") {
+            controller = new AbortController();
+            callerSignal = init && init.signal ? init.signal : null;
+            if (callerSignal) {
+                if (callerSignal.aborted)
+                    controller.abort(callerSignal.reason);
+                else {
+                    onCallerAbort = () => {
+                        try {
+                            controller.abort(callerSignal.reason);
+                        } catch (e) {}
+                    };
+                    try {
+                        callerSignal.addEventListener("abort", onCallerAbort, {
+                            once: true,
+                        });
+                    } catch (e) {}
+                }
+            }
+            timer = setTimeout(() => {
+                try {
+                    controller.abort();
+                } catch (e) {}
+            }, timeout);
             // NOTE: plain fetch() here on purpose — fetchT must never call
             // itself (infinite recursion).
-            return await fetch(url, {
-                ...init,
-                signal: AbortSignal.timeout(timeoutMs),
-            });
+            return await fetch(url, { ...init, signal: controller.signal });
         }
         return await fetch(url, { ...init });
-    } catch (e) {
-        throw e;
+    } finally {
+        if (timer) {
+            try {
+                clearTimeout(timer);
+            } catch (e) {}
+        }
+        if (callerSignal && onCallerAbort) {
+            try {
+                callerSignal.removeEventListener("abort", onCallerAbort);
+            } catch (e) {}
+        }
     }
 }
 const REQ_BYTES_EST = 1073741824 / 6000;
@@ -175,6 +210,65 @@ function withTimeout(promise, ms, label) {
         } catch (e) {}
     });
 }
+// Hard deadlines for every TCP stage. cloudflare:sockets are not
+// AbortSignal-based, so fetch() timeouts do not cover them: each stage
+// needs its own deadline or a stalled relay hangs the request -> 1101.
+const TCP_OPEN_TIMEOUT_MS = 5000;
+const TCP_WRITE_TIMEOUT_MS = 5000;
+const TCP_FIRST_READ_TIMEOUT_MS = 7000;
+const UPSTREAM_WRITE_TIMEOUT_MS = 15000;
+const NAHAN_RUNNER_LEASE_TTL_MS = 120000;
+const UPSTREAM_QUEUE_MAX_BYTES = 4 * 1024 * 1024;
+const UPSTREAM_QUEUE_MAX_ITEMS = 256;
+function closeTcpSocketQuietly(socket) {
+    try {
+        if (socket && typeof socket.close === "function") socket.close();
+    } catch (e) {}
+}
+function releaseWriterQuietly(writer) {
+    try {
+        if (writer && typeof writer.releaseLock === "function")
+            writer.releaseLock();
+    } catch (e) {}
+}
+async function withDeadline(promise, timeoutMs, onTimeout, label = "operation") {
+    let timer = null;
+    let settled = false;
+    const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+            if (settled) return;
+            try {
+                if (typeof onTimeout === "function") onTimeout();
+            } catch (e) {}
+            reject(new Error(`${label}-timeout`));
+        }, timeoutMs);
+    });
+    try {
+        return await Promise.race([promise, timeoutPromise]);
+    } finally {
+        settled = true;
+        if (timer) {
+            try {
+                clearTimeout(timer);
+            } catch (e) {}
+        }
+    }
+}
+async function writeSocketWithTimeout(
+    socket,
+    writer,
+    data,
+    timeoutMs = TCP_WRITE_TIMEOUT_MS,
+) {
+    if (!writer || typeof writer.write !== "function")
+        throw new Error("socket-writer-unavailable");
+    return await withDeadline(
+        writer.write(data),
+        timeoutMs,
+        () => closeTcpSocketQuietly(socket),
+        "socket-write",
+    );
+}
 let uuidUsage = new Map();
 let activeConns = new Map();
 let activeDeviceId = "";
@@ -276,6 +370,18 @@ async function cachedD1Put(env, key, value) {
     if (key === "sys_config") sysConfigCacheTime = 0;
     else if (key === "sys_usage") sysUsageCacheTime = 0;
     else if (key === "backup_ip") backupIpCacheTime = 0;
+}
+// Strict variant: failures propagate to the caller instead of being
+// swallowed. Burial/resurrection MUST use this: a silent persist failure
+// after live rotation was already changed means unrecoverable loss.
+async function d1PutStrict(env, key, value) {
+    if (!env.IOT_DB) throw new Error("d1-unavailable");
+    await d1Init(env);
+    await env.IOT_DB.prepare(
+        "INSERT INTO kv_store (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+    )
+        .bind(key, value)
+        .run();
 }
 
 function sha224Hex(m) {
@@ -575,20 +681,10 @@ export default {
             try {
                 INFLIGHT_HTTP++;
             } catch (e) {}
-            try {
-                if (ctx && typeof ctx.waitUntil === "function") {
-                    ctx.waitUntil(
-                        Promise.resolve().then(() => {
-                            try {
-                                INFLIGHT_HTTP = Math.max(
-                                    0,
-                                    INFLIGHT_HTTP - 1,
-                                );
-                            } catch (e) {}
-                        }),
-                    );
-                }
-            } catch (e) {}
+            // NOTE: INFLIGHT_HTTP is decremented in the fetch finally block
+            // at the end of this handler, never here: decrementing it in a
+            // microtask right after increment made the breaker permanently
+            // blind (always ~0) so load shedding never engaged.
             if (configRegistry.size > 10000) { configRegistry.clear(); trojanHashCache.clear(); }
             await loadSysConfig(env, ctx);
             // Background self-healing sweep (throttled): dead-relay probes
@@ -1152,6 +1248,10 @@ export default {
             return new Response(null, { status: 404 });
         } catch (err) {
             return new Response(null, { status: 404 });
+        } finally {
+            try {
+                INFLIGHT_HTTP = Math.max(0, INFLIGHT_HTTP - 1);
+            } catch (e) {}
         }
     },
     async scheduled(event, env, ctx) {
@@ -6538,6 +6638,105 @@ let lastHealthSave = 0;
 // Round-robin cursors (module-level so they persist across rounds).
 let probeCursor = 0;
 let graveCursor = 0;
+// Persistent cross-isolate runner locks (Sepidar-grade, adapted to nahan's
+// kv_store model). Worker isolates are independent processes: in-memory
+// lastProbeTs/cursors reset on every cold start, so separate isolates each
+// believed maintenance was due and starved later relays. The lease lives in
+// D1 with an expiry so a crashed isolate cannot hold it forever. Release
+// and refresh compare the exact lease value so an old owner can never
+// delete/overwrite a new owner's lease.
+async function acquireNahanRunnerLock(
+    env,
+    jobKey,
+    intervalMs,
+    lockGroup = "nahan-relay",
+) {
+    const physicalKey = "nahan_lock:" + String(lockGroup || "nahan-relay");
+    const scheduleKey = "nahan_runner_last_" + String(jobKey || "job");
+    let lease = null;
+    try {
+        if (!env || !env.IOT_DB) return null;
+        const now = Date.now();
+        const until = now + NAHAN_RUNNER_LEASE_TTL_MS;
+        try {
+            const r = await env.IOT_DB.prepare(
+                "UPDATE kv_store SET value=? WHERE key=? AND CAST(value AS INTEGER)<?",
+            )
+                .bind(String(until), physicalKey, now)
+                .run();
+            if (r && r.meta && r.meta.changes > 0)
+                lease = { lockKey: physicalKey, until, scheduleKey };
+        } catch (e) {}
+        if (!lease) {
+            try {
+                const r = await env.IOT_DB.prepare(
+                    "INSERT OR IGNORE INTO kv_store(key,value) VALUES(?,?)",
+                )
+                    .bind(physicalKey, String(until))
+                    .run();
+                if (r && r.meta && r.meta.changes > 0)
+                    lease = { lockKey: physicalKey, until, scheduleKey };
+            } catch (e) {}
+        }
+        if (!lease) return null;
+        let lastRun = 0;
+        try {
+            const row = await env.IOT_DB.prepare(
+                "SELECT value FROM kv_store WHERE key=?",
+            )
+                .bind(scheduleKey)
+                .first();
+            lastRun = Number((row && row.value) || 0) || 0;
+        } catch (e) {}
+        if (intervalMs > 0 && now - lastRun < intervalMs) {
+            await releaseNahanRunnerLock(env, lease);
+            return null;
+        }
+        try {
+            await env.IOT_DB.prepare(
+                "INSERT INTO kv_store(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            )
+                .bind(scheduleKey, String(now))
+                .run();
+        } catch (e) {
+            await releaseNahanRunnerLock(env, lease);
+            return null;
+        }
+        return lease;
+    } catch (e) {
+        try {
+            if (lease) await releaseNahanRunnerLock(env, lease);
+        } catch (_) {}
+        return null;
+    }
+}
+async function refreshNahanRunnerLease(env, lease) {
+    try {
+        if (!lease || !env || !env.IOT_DB) return false;
+        const nextUntil = Date.now() + NAHAN_RUNNER_LEASE_TTL_MS;
+        const r = await env.IOT_DB.prepare(
+            "UPDATE kv_store SET value=? WHERE key=? AND value=?",
+        )
+            .bind(String(nextUntil), lease.lockKey, String(lease.until))
+            .run();
+        if (r && r.meta && r.meta.changes > 0) {
+            lease.until = nextUntil;
+            return true;
+        }
+    } catch (e) {}
+    return false;
+}
+async function releaseNahanRunnerLock(env, lease) {
+    try {
+        if (lease && env && env.IOT_DB) {
+            await env.IOT_DB.prepare(
+                "DELETE FROM kv_store WHERE key=? AND value=?",
+            )
+                .bind(lease.lockKey, String(lease.until))
+                .run();
+        }
+    } catch (e) {}
+}
 function relayKeyOf(tok) {
     try {
         let s = String(tok || "").trim();
@@ -6715,27 +6914,28 @@ function recordAiSuccess(host, port) {
 }
 // Token-string variant: Nahan chains carry "IP[:port][#Name]" strings.
 function filterAiQuarantinedTokens(list) {
+    // Fail-closed: a known-bad relay must not be reintroduced merely
+    // because the healthy set is empty. Empty means explicit failure.
     try {
-        const out = (list || []).filter((t) => {
+        return (list || []).filter((t) => {
             const rk = relayKeyOf(t);
             if (!rk) return true;
             return !isAiQuarantined(rk.host, rk.port);
         });
-        return out.length > 0 ? out : list || [];
     } catch (e) {
-        return list || [];
+        return [];
     }
 }
 function filterQuarantinedRelays(list) {
+    // Fail-closed: see above.
     try {
-        const live = (list || []).filter((t) => {
+        return (list || []).filter((t) => {
             const rk = relayKeyOf(t);
             if (!rk) return true;
             return !isRelayQuarantined(rk.host, rk.port);
         });
-        return live.length > 0 ? live : list || [];
     } catch (e) {
-        return list || [];
+        return [];
     }
 }
 // ==== AI smart egress (same structure as Sepidar panel) ====
@@ -6932,7 +7132,7 @@ async function probeRelayOnce(host, port, timeoutMs) {
         if (!hello) return false;
         const writer = sock.writable.getWriter();
         try {
-            await withTimeout(writer.write(hello), PM, "probe-timeout");
+            await writeSocketWithTimeout(sock, writer, hello, PM);
         } finally {
             try {
                 writer.releaseLock();
@@ -7008,9 +7208,14 @@ function pruneAutomationOff() {
         return false;
     }
 }
+let RELAY_SNAPSHOT_LOADED = false;
 async function loadRelayHealthSnapshot(env) {
     try {
-        if (RELAY_Q.size > 0) return;
+        if (RELAY_SNAPSHOT_LOADED) return;
+        if (RELAY_Q.size > 0) {
+            RELAY_SNAPSHOT_LOADED = true;
+            return;
+        }
         const raw = await d1Get(env, "relay_health");
         if (!raw) return;
         const snap = JSON.parse(raw);
@@ -7020,6 +7225,7 @@ async function loadRelayHealthSnapshot(env) {
             if (q[k] && q[k] > now && RELAY_Q.size < 2000)
                 RELAY_Q.set(k, { fail: 0, until: q[k], probeFail: 0 });
         }
+        RELAY_SNAPSHOT_LOADED = true;
     } catch (e) {}
 }
 async function saveRelayHealthSnapshot(env) {
@@ -7035,11 +7241,21 @@ async function saveRelayHealthSnapshot(env) {
             }
         }
         if (active > 0) {
-            await d1Put(
-                env,
-                "relay_health",
-                JSON.stringify({ q }).slice(0, 8000),
-            );
+            // Never byte-slice JSON: slicing can produce invalid state the
+            // next isolate cannot parse. Evict oldest entries instead.
+            const entries = Object.entries(q).sort((a, b) => a[1] - b[1]);
+            let payload = JSON.stringify({ q });
+            while (payload.length > 8000 && entries.length > 0) {
+                delete q[entries.shift()[0]];
+                payload = JSON.stringify({ q });
+            }
+            if (payload.length > 8000) {
+                try {
+                    console.error("[relay] health snapshot too large, skip");
+                } catch (e) {}
+                return;
+            }
+            await d1Put(env, "relay_health", payload);
         } else {
             await d1Put(env, "relay_health", "{}");
         }
@@ -7048,6 +7264,14 @@ async function saveRelayHealthSnapshot(env) {
 async function probeDeadRelays(env) {
     try {
         if (pruneAutomationOff()) return;
+        if (!env || !env.IOT_DB) return;
+        const runnerLease = await acquireNahanRunnerLock(
+            env,
+            "probe",
+            PROBE_INTERVAL_MS,
+        );
+        if (!runnerLease) return;
+        try {
         const now = Date.now();
         if (now - lastProbeTs < PROBE_INTERVAL_MS) return;
         lastProbeTs = now;
@@ -7074,10 +7298,23 @@ async function probeDeadRelays(env) {
                 probeCap = Math.max(1, Math.floor(probeCap / 2));
         } catch (e) {}
         if (typeof probeCursor !== "number") probeCursor = 0;
+        // Persistent cursor: isolates are ephemeral, so an in-memory cursor
+        // alone restarts at zero on every cold start and starves later relays.
+        try {
+            if (scored.length > 0) {
+                const stored = await d1Get(env, "nahan_runner_probe_cursor");
+                const n = Number(stored);
+                if (Number.isFinite(n) && n >= 0)
+                    probeCursor = Math.floor(n) % scored.length;
+            }
+        } catch (e) {}
         const rotated = [];
         for (let i = 0; i < scored.length; i++)
             rotated.push(scored[(probeCursor + i) % scored.length]);
         probeCursor = (probeCursor + probeCap) % scored.length;
+        try {
+            await d1Put(env, "nahan_runner_probe_cursor", String(probeCursor));
+        } catch (e) {}
         const picked = rotated.slice(0, probeCap);
         // Probes run in parallel (bounded to probeCap relays) so
         // a full round fits the background-task budget; mutations below
@@ -7112,6 +7349,9 @@ async function probeDeadRelays(env) {
             }
         }
         await saveRelayHealthSnapshot(env);
+        } finally {
+            await releaseNahanRunnerLock(env, runnerLease);
+        }
     } catch (e) {}
 }
 async function buryDeadRelay(env, host, port) {
@@ -7153,8 +7393,14 @@ async function buryDeadRelay(env, host, port) {
                 return false;
             }
         };
+        // Two-phase burial (Sepidar-grade): scan everything FIRST without
+        // mutating, persist the grave BEFORE touching live rotation, then
+        // remove from rotation. A storage failure can never silently destroy
+        // rotation entries without leaving a recovery record behind.
         const lists = [];
         let aiKeep = false;
+        const globalChanges = [];
+        const userChanges = [];
         try {
             for (const field of ["backupRelay", "customRelay"]) {
                 const raw = sysConfig[field] || "";
@@ -7164,18 +7410,13 @@ async function buryDeadRelay(env, host, port) {
                 if (removed > 0) {
                     if (tokenHasAi(raw)) aiKeep = true;
                     lists.push("global:" + field);
-                    sysConfig[field] = kept.join(",");
-                    await d1Put(
-                        env,
-                        "sys_config",
-                        JSON.stringify(sysConfig),
-                    );
+                    if (kept.length > 0)
+                        globalChanges.push({ field, next: kept.join(",") });
                 }
             }
         } catch (e) {}
         try {
             const users = sysConfig.users || [];
-            let touched = false;
             for (const u of users) {
                 try {
                     const raw = u.proxyIp || "";
@@ -7186,17 +7427,19 @@ async function buryDeadRelay(env, host, port) {
                         continue;
                     const { kept, removed } = stripDead(raw);
                     if (removed === 0) continue;
+                    // Sole/last relay of a user is deliberately preserved:
+                    // remember the placement but do not claim a burial.
                     if (kept.length === 0) continue;
                     if (tokenHasAi(raw)) aiKeep = true;
-                    u.proxyIp = kept.join(",");
                     lists.push("user:" + (u.name || u.id));
-                    touched = true;
+                    userChanges.push({ u, next: kept.join(",") });
                 } catch (e) {}
             }
-            if (touched)
-                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
         } catch (e) {}
-        if (lists.length === 0) return true;
+        // Nothing was actually removed from live rotation: do not clear
+        // quarantine and do not create a misleading grave.
+        if (globalChanges.length === 0 && userChanges.length === 0)
+            return false;
         try {
             let g = {};
             try {
@@ -7229,26 +7472,73 @@ async function buryDeadRelay(env, host, port) {
                 unstable: flaps.length >= FLAP_LIMIT,
             };
             g[deadKey] = entry;
+            // Never evict the grave we just created to stay under a cap,
+            // and never byte-slice JSON: evict oldest entries instead.
             const gk = Object.keys(g);
             if (gk.length > 50) {
-                gk.sort(
+                const candidates = gk.filter((k) => k !== deadKey);
+                candidates.sort(
                     (a, b) =>
                         ((g[a] && g[a].buriedAt) || 0) -
                         ((g[b] && g[b].buriedAt) || 0),
                 );
-                for (const drop of gk.slice(0, gk.length - 50)) {
+                for (const drop of candidates.slice(
+                    0,
+                    Math.max(0, gk.length - 50),
+                )) {
                     try {
                         delete g[drop];
                     } catch (e) {}
                 }
             }
-            await d1Put(env, "relay_graveyard", JSON.stringify(g));
+            let gravePayload = JSON.stringify(g);
+            if (gravePayload.length > 200000) {
+                const ordered = Object.keys(g)
+                    .filter((k) => k !== deadKey)
+                    .sort(
+                        (a, b) =>
+                            ((g[a] && g[a].buriedAt) || 0) -
+                            ((g[b] && g[b].buriedAt) || 0),
+                    );
+                for (const drop of ordered) {
+                    delete g[drop];
+                    gravePayload = JSON.stringify(g);
+                    if (gravePayload.length <= 200000) break;
+                }
+            }
+            if (gravePayload.length > 200000) return false;
+            try {
+                await d1PutStrict(env, "relay_graveyard", gravePayload);
+            } catch (e) {
+                return false;
+            }
+            // Grave is durable: now remove from live rotation. Any partial
+            // D1 failure here can be healed later by resurrectRelay().
+            const prevGlobals = {};
+            const prevUsers = new Map();
+            try {
+                for (const c of globalChanges)
+                    prevGlobals[c.field] = sysConfig[c.field];
+                for (const c of userChanges) prevUsers.set(c.u, c.u.proxyIp);
+                for (const c of globalChanges) sysConfig[c.field] = c.next;
+                for (const c of userChanges) c.u.proxyIp = c.next;
+                await d1PutStrict(env, "sys_config", JSON.stringify(sysConfig));
+            } catch (e) {
+                try {
+                    for (const k of Object.keys(prevGlobals))
+                        sysConfig[k] = prevGlobals[k];
+                    for (const [u, prev] of prevUsers) u.proxyIp = prev;
+                } catch (_) {}
+                return false;
+            }
             try {
                 console.error(
                     "relay-buried: " + deadKey + " from " + lists.join(","),
                 );
             } catch (e) {}
-        } catch (e) {}
+        } catch (e) {
+            return false;
+        }
         return true;
     } catch (e) {
         return false;
@@ -7257,10 +7547,15 @@ async function buryDeadRelay(env, host, port) {
 function nowTs() {
     return Date.now();
 }
+let lastResurrectChanged = false;
 async function resurrectRelay(env, key, entry) {
+    // Returns true when the grave entry can be closed (re-added or already
+    // present). Only an actual restoration counts as a change: flap history
+    // must not be inflated by already-present relays.
+    lastResurrectChanged = false;
     try {
         const host = String(entry.host || "").toLowerCase();
-        if (!host) return true;
+        if (!host) return false;
         const port = entry.port || 443;
         // Restore the #AI flag when the buried relay had one (names are
         // re-added bare, as before — only the flag round-trips).
@@ -7283,26 +7578,54 @@ async function resurrectRelay(env, key, entry) {
                 ? String(raw).replace(/,+$/, "") + ","
                 : "") + token;
         };
+        let restoreChanged = false;
         for (const l of entry.lists || []) {
             try {
                 if (l === "global:backupRelay") {
-                    sysConfig.backupRelay = addToken(
-                        sysConfig.backupRelay,
-                    );
+                    const before = sysConfig.backupRelay;
+                    const after = addToken(before);
+                    if (after !== before) {
+                        sysConfig.backupRelay = after;
+                        restoreChanged = true;
+                    }
                 } else if (l === "global:customRelay") {
-                    sysConfig.customRelay = addToken(
-                        sysConfig.customRelay,
-                    );
+                    const before = sysConfig.customRelay;
+                    const after = addToken(before);
+                    if (after !== before) {
+                        sysConfig.customRelay = after;
+                        restoreChanged = true;
+                    }
                 } else if (l.startsWith("user:")) {
                     const nm = l.slice(5);
                     const u = (sysConfig.users || []).find(
                         (x) => x && (x.name === nm || x.id === nm),
                     );
-                    if (u) u.proxyIp = addToken(u.proxyIp);
+                    // Missing user (deleted account) is tolerated: it must
+                    // not block an otherwise valid resurrection.
+                    if (!u) continue;
+                    const before = u.proxyIp;
+                    const after = addToken(before);
+                    if (after !== before) {
+                        u.proxyIp = after;
+                        restoreChanged = true;
+                    }
                 }
-            } catch (e) {}
+            } catch (e) {
+                return false;
+            }
         }
-        await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+        if (!restoreChanged) {
+            try {
+                console.error("relay-already-present: " + key);
+            } catch (e) {}
+            return true;
+        }
+        try {
+            await d1PutStrict(env, "sys_config", JSON.stringify(sysConfig));
+        } catch (e) {
+            return false;
+        }
+        lastResurrectChanged = true;
         try {
             console.error("relay-resurrected: " + key);
         } catch (e) {}
@@ -7314,6 +7637,14 @@ async function resurrectRelay(env, key, entry) {
 async function probeGraveyard(env) {
     try {
         if (pruneAutomationOff()) return;
+        if (!env || !env.IOT_DB) return;
+        const runnerLease = await acquireNahanRunnerLock(
+            env,
+            "graveyard",
+            GRAVE_INTERVAL_MS,
+        );
+        if (!runnerLease) return;
+        try {
         const now = Date.now();
         if (now - lastGraveTs < GRAVE_INTERVAL_MS) return;
         lastGraveTs = now;
@@ -7331,6 +7662,12 @@ async function probeGraveyard(env) {
         // Round-robin over oldest-first order so graves past the per-round
         // cap are not starved (same guarantee as Sepidar).
         if (typeof graveCursor !== "number") graveCursor = 0;
+        try {
+            const stored = await d1Get(env, "nahan_runner_grave_cursor");
+            const n = Number(stored);
+            if (Number.isFinite(n) && n >= 0)
+                graveCursor = Math.floor(n) % keys.length;
+        } catch (e) {}
         const grotated = [];
         for (let i = 0; i < keys.length; i++)
             grotated.push(keys[(graveCursor + i) % keys.length]);
@@ -7341,6 +7678,9 @@ async function probeGraveyard(env) {
                 graveCap = Math.max(1, Math.floor(graveCap / 2));
         } catch (e) {}
         graveCursor = (graveCursor + graveCap) % keys.length;
+        try {
+            await d1Put(env, "nahan_runner_grave_cursor", String(graveCursor));
+        } catch (e) {}
         // Probes in parallel (bounded); grave/config mutations below stay
         // sequential to avoid concurrent sys_config writes.
         const graveTargets = grotated.slice(0, graveCap);
@@ -7369,20 +7709,34 @@ async function probeGraveyard(env) {
             if (ok) {
                 entry.healthyStreak = (entry.healthyStreak || 0) + 1;
                 if (entry.healthyStreak >= GRAVE_HEALTHY_NEED) {
+                    // Close the grave ONLY on confirmed success, never on a
+                    // half-finished resurrect (otherwise placements are lost).
+                    let okR = false;
                     try {
-                        await resurrectRelay(env, k, entry);
-                    } catch (e) {}
-                    try {
-                        const fm = JSON.parse(
-                            (await d1Get(env, "relay_flaps")) || "{}",
-                        );
-                        const arr = Array.isArray(fm[k]) ? fm[k] : [];
-                        arr.push(Date.now());
-                        fm[k] = arr
-                            .filter((t) => Date.now() - t < FLAP_WINDOW_MS)
-                            .slice(-10);
-                        await d1Put(env, "relay_flaps", JSON.stringify(fm));
-                    } catch (e) {}
+                        okR = await resurrectRelay(env, k, entry);
+                    } catch (e) {
+                        okR = false;
+                    }
+                    if (!okR) {
+                        entry.healthyStreak = 0;
+                        dirty = true;
+                        continue;
+                    }
+                    // Flap history only on real restoration: an already-live
+                    // relay must not inflate flap counts.
+                    if (lastResurrectChanged) {
+                        try {
+                            const fm = JSON.parse(
+                                (await d1Get(env, "relay_flaps")) || "{}",
+                            );
+                            const arr = Array.isArray(fm[k]) ? fm[k] : [];
+                            arr.push(Date.now());
+                            fm[k] = arr
+                                .filter((t) => Date.now() - t < FLAP_WINDOW_MS)
+                                .slice(-10);
+                            await d1Put(env, "relay_flaps", JSON.stringify(fm));
+                        } catch (e) {}
+                    }
                     recordRelaySuccess(entry.host, entry.port || 443, true);
                     delete g[k];
                     dirty = true;
@@ -7398,6 +7752,9 @@ async function probeGraveyard(env) {
             }
         }
         if (dirty) await d1Put(env, "relay_graveyard", JSON.stringify(g));
+        } finally {
+            await releaseNahanRunnerLock(env, runnerLease);
+        }
     } catch (e) {}
 }
 // Reconnect-storm backoff (per-IP, in-memory): generous caps compatible
@@ -7471,6 +7828,14 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
     // Per-connection byte counters (up+down). Flushed to usage on close.
     let connBytesUp = 0;
     let connBytesDown = 0;
+    // Relay ownership for this tunnel generation: only downstream bytes on
+    // THIS socket may confirm the selected relay (an old stream must never
+    // credit a new relay). Upstream is bounded so a flooding client cannot
+    // grow memory without limit.
+    let activeRelay = null;
+    let relayConfirmed = false;
+    let pendingUpBytes = 0;
+    let pendingUpItems = 0;
     webSocket.addEventListener("close", () => {
         activeConnections--;
         try {
@@ -7494,7 +7859,21 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
         queue = Promise.resolve();
     let activeClientHash = null;
     webSocket.addEventListener("message", (event) => {
+        const size = event.data?.byteLength || 0;
+        pendingUpBytes += size;
+        pendingUpItems++;
+        if (
+            pendingUpBytes > UPSTREAM_QUEUE_MAX_BYTES ||
+            pendingUpItems > UPSTREAM_QUEUE_MAX_ITEMS
+        ) {
+            try {
+                webSocket.close();
+            } catch (e) {}
+            return;
+        }
         queue = queue.then(async () => {
+            pendingUpBytes = Math.max(0, pendingUpBytes - size);
+            pendingUpItems = Math.max(0, pendingUpItems - 1);
             try {
                 if (isInit) {
                     isInit = false;
@@ -7504,7 +7883,26 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
                     );
                     if (isModeAlpha) webSocket.send(new Uint8Array([0, 0]));
                 } else if (dataWriter) {
-                    await dataWriter.write(event.data);
+                    // Timed write: a stalled TCP write must reject and tear
+                    // down the tunnel, never hang the queue forever (->1101).
+                    try {
+                        await writeSocketWithTimeout(
+                            remoteSocket,
+                            dataWriter,
+                            event.data,
+                            UPSTREAM_WRITE_TIMEOUT_MS,
+                        );
+                    } catch (werr) {
+                        closeTcpSocketQuietly(remoteSocket);
+                        try {
+                            releaseWriterQuietly(dataWriter);
+                        } catch (e) {}
+                        dataWriter = null;
+                        try {
+                            webSocket.close();
+                        } catch (e) {}
+                        return;
+                    }
                     try {
                         connBytesUp += event.data?.byteLength || 0;
                     } catch (e) {}
@@ -7750,7 +8148,14 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
 
         try {
             remoteSocket = connect({ hostname: connectAddr, port: targetPort });
-            await withTimeout(remoteSocket.opened, 5000, "connect-timeout");
+            await withDeadline(
+                remoteSocket.opened,
+                TCP_OPEN_TIMEOUT_MS,
+                () => closeTcpSocketQuietly(remoteSocket),
+                "direct-open",
+            );
+            activeRelay = null;
+            relayConfirmed = false;
         } catch {
             let pips = [];
             if (activeProfile && activeProfile.proxyIp) {
@@ -7828,19 +8233,25 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
                         hostname: altIP,
                         port: altPortClean ? Number(altPortClean) : targetPort,
                     });
-                    await withTimeout(
+                    await withDeadline(
                         remoteSocket.opened,
-                        5000,
-                        "connect-timeout",
+                        TCP_OPEN_TIMEOUT_MS,
+                        () => closeTcpSocketQuietly(remoteSocket),
+                        "relay-open",
                     );
                     connected = true;
-                    if (rkFail) {
-                        recordRelaySuccess(rkFail.host, rkFail.port, false);
-                        try {
-                            if (aiEgress)
-                                recordAiSuccess(rkFail.host, rkFail.port);
-                        } catch (e) {}
-                    }
+                    // No instant success credit: a TCP accept is weak proof
+                    // (a dead relay accepts TCP then hangs). The relay is
+                    // bound to this tunnel generation and confirmed only by
+                    // real downstream bytes in the pipe below.
+                    relayConfirmed = false;
+                    activeRelay = rkFail
+                        ? {
+                              host: rkFail.host,
+                              port: rkFail.port,
+                              ai: aiEgress,
+                          }
+                        : null;
                     break;
                 } catch (e) {
                     if (rkFail) {
@@ -7864,21 +8275,79 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
         dataWriter = remoteSocket.writable.getWriter();
         if (offset < bufferData.byteLength) {
             let chunk = bufferData.slice(offset);
-            await dataWriter.write(chunk);
+            // Timed initial write: never hang the handshake path.
+            try {
+                await writeSocketWithTimeout(
+                    remoteSocket,
+                    dataWriter,
+                    chunk,
+                    TCP_WRITE_TIMEOUT_MS,
+                );
+            } catch (e) {
+                closeTcpSocketQuietly(remoteSocket);
+                try {
+                    releaseWriterQuietly(dataWriter);
+                } catch (_) {}
+                dataWriter = null;
+                try {
+                    webSocket.close();
+                } catch (_) {}
+                return isModeAlpha;
+            }
             try {
                 connBytesUp += chunk.byteLength || 0;
             } catch (e) {}
         }
-        remoteSocket.readable.pipeTo(
-            new WritableStream({
-                write(chunk) {
+        // Downstream pipe: the FIRST real bytes on this socket confirm the
+        // bound relay (end-to-end proof). Completion closes the client side
+        // so a dead remote cannot leave a half-open tunnel behind.
+        try {
+            remoteSocket.readable
+                .pipeTo(
+                    new WritableStream({
+                        write(chunk) {
+                            try {
+                                connBytesDown += chunk?.byteLength || 0;
+                                const n =
+                                    (chunk && chunk.byteLength) || 0;
+                                if (
+                                    n > 0 &&
+                                    activeRelay &&
+                                    !relayConfirmed
+                                ) {
+                                    relayConfirmed = true;
+                                    try {
+                                        recordRelaySuccess(
+                                            activeRelay.host,
+                                            activeRelay.port,
+                                            true,
+                                        );
+                                    } catch (e) {}
+                                    try {
+                                        if (activeRelay.ai)
+                                            recordAiSuccess(
+                                                activeRelay.host,
+                                                activeRelay.port,
+                                            );
+                                    } catch (e) {}
+                                }
+                            } catch (e) {}
+                            try {
+                                webSocket.send(chunk);
+                            } catch (e) {}
+                        },
+                        close() {},
+                        abort() {},
+                    }),
+                )
+                .catch(() => {})
+                .finally(() => {
+                    closeTcpSocketQuietly(remoteSocket);
                     try {
-                        connBytesDown += chunk?.byteLength || 0;
+                        webSocket.close();
                     } catch (e) {}
-                    webSocket.send(chunk);
-                },
-            }),
-        );
+                });
+        } catch (e) {}
 
         return isModeAlpha;
     }

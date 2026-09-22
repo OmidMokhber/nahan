@@ -8,6 +8,19 @@ All notable changes to Project Nahan will be documented in this file.
 <!-- LANG:EN -->
 
 
+## [3.0.3] - ۱۴۰۵-۰۶-۳۰ (2026-09-21)
+
+<!-- LANG:FA -->
+### دیباگ موارد حیاتی (Critical Stability Debug)
+- **دیباگ موارد حیاتی**: رفع هنگ write سوکت آپ‌استریم با deadline و بستن سوکت (عامل 1101)، فیلتر fail-closed رله‌ها، تایید سلامت رله فقط با بایت downstream، قفل cross-isolate و کرسر پایدار D1 برای پروب/قبرستون، دفن امن grave-first با rollback، و ترمیم breaker.
+<!-- LANG:FA -->
+
+<!-- LANG:EN -->
+### Critical Stability Debug
+- **Critical stability debug**: fixed upstream socket-write hangs with deadlines and socket close (1101 cause), fail-closed relay filtering, relay health confirmed only by downstream bytes, cross-isolate D1 locks with persistent probe/graveyard cursors, grave-first safe burial with rollback, and breaker repair.
+<!-- LANG:EN -->
+
+
 ## [3.0.2] - ۱۴۰۵-۰۶-۲۷ (2026-09-18)
 
 <!-- LANG:FA -->
